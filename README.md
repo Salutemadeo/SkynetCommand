@@ -4,6 +4,8 @@
 <p align="center"><b>Voice macros for games, powered by the Whisper speech AI</b><br>
 Say <i>"hellbomb"</i>, <i>"orbital laser"</i>, <i>"resupply"</i> and the stratagem is typed in for you.</p>
 
+<p align="center"><a href="https://github.com/Salutemadeo/SkynetCommand/raw/main/download/SkynetCommand.zip"><b>⬇ DOWNLOAD (Windows)</b></a></p>
+
 <p align="center">Made by <b>Salutem</b> · <a href="https://steamcommunity.com/id/hecton/">Steam</a> · Discord: <code>hekton</code></p>
 
 > [!IMPORTANT]
@@ -12,7 +14,8 @@ Say <i>"hellbomb"</i>, <i>"orbital laser"</i>, <i>"resupply"</i> and the stratag
 
 ## Download & install (Windows 10 / 11)
 
-1. Download **`SkynetCommand.zip`** from the [latest release](../../releases/latest) and unzip it anywhere (e.g. Documents). Don't run it from inside the zip.
+1. **[⬇ Download SkynetCommand.zip](https://github.com/Salutemadeo/SkynetCommand/raw/main/download/SkynetCommand.zip)** and unzip it anywhere (e.g. Documents). Don't run it from inside the zip.
+   *(or: green **Code** button → **Download ZIP** - same files)*
 2. Double-click **`1 - SETUP (run once).bat`**. It needs internet once (~5 minutes) and puts a private Python and the speech engine **inside that folder**. Nothing is installed in Windows.
 3. Start it with the **Skynet Command** shortcut (eye icon). The first start downloads the speech model once.
 
