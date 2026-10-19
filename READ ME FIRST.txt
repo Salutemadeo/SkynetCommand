@@ -1,0 +1,32 @@
+SKYNET COMMAND - voice macros for games (Helldivers 2 stratagems ready to go)
+Made by Salutem  -  Steam: https://steamcommunity.com/id/hecton/  -  Discord: hekton
+
+!! THIS APP IS FREE. IT CANNOT BE SOLD. If you paid for it, you were scammed. (see LICENSE.txt)
+
+You say a command ("hellbomb", "orbital laser", "resupply") and the app presses the keys in the game for you.
+The speech AI (Whisper) runs on your own PC - nothing is sent to the internet.
+
+INSTALL (one time, needs internet, ~5 minutes, Windows 10 or 11)
+  1. Unzip this whole folder somewhere you like (e.g. Documents). Do not run it from inside the zip.
+  2. Double-click  "1 - SETUP (run once).bat"
+     It downloads a private copy of Python and the speech engine INTO THIS FOLDER.
+     Nothing is installed in Windows; your other programs are not touched.
+  3. When it says DONE, Skynet Command starts. The very first start downloads the speech model once.
+
+START IT
+  Double-click  "Skynet Command"  (the eye icon) - or "Skynet Command.bat".
+
+NVIDIA GRAPHICS CARD? (optional, ~1 GB)
+  Double-click "GPU boost (NVIDIA only).bat" - the bigger, more accurate model then runs on your graphics card.
+  If your game's FPS drops when you speak: OPTIONS -> PERFORMANCE (AI LOAD: low) or a smaller WHISPER MODEL.
+
+QUICK TIPS
+  - Push-to-talk: OPTIONS -> LISTEN MODE: ptt, then pick a key (a mouse side button works great).
+  - Click the eye (top left) to switch auto-detect game on/off. Click the first symbol top right to switch the speech AI off/on.
+  - Lower OPTIONS -> MACRO SPEED (e.g. 30-35 ms) for faster stratagems; raise it if the game misses arrows.
+  - A command not recognised? Click its line in the COMMAND LOG to teach it.
+
+UNINSTALL
+  Delete this folder (and the Desktop shortcut if you made one). That's all.
+
+Everything lives in this folder:  app\ (the program, your settings, profiles)  runtime\ (private Python)  models\ (speech AI)

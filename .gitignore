@@ -1,0 +1,8 @@
+runtime/
+models/
+app/settings.json
+app/profiles/
+app/logs/
+app/sfx/
+__pycache__/
+*.lnk
