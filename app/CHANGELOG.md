@@ -19,7 +19,7 @@ Folder on the PC: `Documents\Skynet Command\`
 | `Install GPU boost.bat` | NVIDIA only: CUDA libraries for the speech engine (also started from ⚙ OPTIONS → GPU BOOST) |
 | `Setup (run once).bat` | Only needed without Skynet Alpha: Python 3.12 venv + faster-whisper, PyAudioWPatch, numpy |
 | `LICENSE.txt` | PolyForm Noncommercial 1.0.0 + Required Notice (Salutem): free, no selling |
-| `skynet_command.ico` / `skynet_command_logo.png` | Skynet eye logo (16-256 px icon, each size drawn natively; 1024 px PNG) - made by `make_icon.py` (Pillow, run in the sandbox) |
+| `skynet_command.ico` / `skynet_command_logo.png` | Hex-core logo (16-256 px icon, each size drawn natively; 1024 px PNG) - made by `make_icon.py` (Pillow, run in the sandbox) |
 | `profiles\*.json` | One profile per game (created on first start: Helldivers 2, Windows example) |
 | `settings.json`, `sfx\`, `logs\app-errors.txt` | Created at runtime |
 
@@ -39,6 +39,97 @@ Folder on the PC: `Documents\Skynet Command\`
 - Whisper model: `auto` = large-v3-turbo on an NVIDIA GPU (uses Skynet Alpha's GPU boost libraries), base.en on CPU.
 - **Import** VoiceAttack `.vap` profiles (XML export), including `[a;b]` phrase syntax and key press/down/up/pause/say actions.
 - Spoken replies (`say ...`) use the Windows en-US voice through one persistent PowerShell process. The mic is muted while the app speaks or beeps.
+
+## v33: stratagem icons
+- Every Helldivers 2 command now shows its stratagem icon next to its name, and a big version on the hover card. They show in both the English and German profile, and in any command of your own that calls the same stratagem.
+- The icons are taken from the "BIT BETTER UI" mod by SquidARMY7 (Nexus Mods 12146), Normal Guided Eagle option. They are coloured like in the game: orbital and eagle red, weapons, backpacks and vehicles blue, sentries, emplacements and mines green, mission yellow.
+- They live in `icons/hd2/<arrow code>_26.png` and `_56.png` on this PC only, and are NOT part of the shared package or GitHub, because the mod's art is not ours to share. Without that folder the app just shows no icons.
+- 106 of 116 commands have an icon. The mod has no icon for SSSD Delivery, Aquifer Drill, Tactical Video Camera, E-711 Extraction Drill, Portable Comms Relay, Bullet Storm, Directional Shield, Breakthrough Exosuit, Apex or Nova.
+
+## v32: speaker commands tested live
+- Tested on the real PC: a German voice clip played through the speakers (no microphone) was recognised. It matched SOS-Bake, Verstärkung, A/AC-8 Maschinenkanonengeschütz, Orbitales Napalm-Sperrfeuer and LIFT-182 Warp-Paket. Commands only FIRE while Helldivers 2 is in front, because ONLY WHEN GAME IS IN FRONT is on.
+- Your own voice is now always recognised first. From the speakers, only the newest short phrase (3.5 s or less) goes to the speech AI. Long talk, videos and game dialogue no longer pile up in front of a real command and make it arrive too late, and the GPU has less to do.
+- Speaker phrases are recognised in your command language, as German friends would expect. English stratagem names still match as before.
+
+## v31: friends' commands actually fire
+- Friends coming through the speakers can now speak either language. In German mode, "Orbital Laser", "Reinforce" or "Eagle 500kg bomb" fire your German commands, and German words work in English mode too. Whisper works out which language they speak, and the stratagem is found by its arrow code. Your own profiles stay separate.
+- Friends' commands may arrive up to 3 s late before they are dropped, even if your MAX AGE is shorter. Speech coming through the speakers takes a little longer to reach the app.
+- When nothing matches, the log shows a grey `◂ speakers: "…" → no match (closest …)` line, so you can see what was heard.
+- Fixed: the double-trigger and game-call-out guards now run before the command fires, not after. The call-out guard only skips repeats of commands YOU said, not your friends' commands.
+
+## v30: every sound source
+- **★ ALL SOUND SOURCES** is a new entry at the top of RECORDING DEVICE, and it is now the default. It listens to every microphone and every output (speakers or headphones) at once, so commands work from your mic, from friends on Discord, or from anything else your PC plays.
+- Push-to-talk still applies to your microphones. Outputs are always listened to, but only voice-like sound reaches the speech AI.
+- If the same command is heard by two devices within 2 s, it fires only once.
+- A device that is busy or can't be opened is skipped quietly.
+- Fixed: error spam in `app-errors.txt` from the taskbar icon (`_ICON_HANDLES`).
+
+## v29: speakers in the recording device list
+- **RECORDING DEVICE** (Options and the main window) now lists your outputs too:
+  - **SPEAKERS ▸ ...** listens to what your PC plays, so friends in Discord or game voice chat can say commands.
+  - **MIC + SPEAKERS ▸ ...** listens to you and your friends.
+- The speaker listener is always on, even in push-to-talk mode, because friends can't press your key. LOCK still stops it.
+- It ignores the app's own sounds and voice while they play.
+- Only voice-like sound is sent to the speech AI. Gunfire, explosions and static are dropped first, so they use no GPU.
+- When friends are just chatting, there is no log spam, no fail buzz and your combo isn't lost. A command they fire is marked `· via speakers` in the log.
+- If the speakers repeat a command you used in the last 12 s, it is ignored. This stops the game's own call-outs, like "Reinforcing!", from firing it again.
+
+## v28: the eye is the logo
+- The Skynet eye at the top left now looks like the app icon: a hex core behind 6 armoured lids.
+- The lids work like a camera aperture. They slide in with a twist to shut, slide out to open, and blink now and then. The core still follows your mouse.
+- New metal sounds when the eye opens or closes, one set per theme:
+  - Skynet: servo whine, 6 clanks and a heavy lock
+  - Nano: light servo, bright pings and an air release
+  - Blackwatch: hydraulic hiss, steel bolts and an armoured slam
+
+## v27: icon refresh
+- Shortcuts kept showing the old red-eye icon because Windows caches icons by file name. The hex-core icon is now also saved as `skynet_command_v5.ico`, and every shortcut that starts Skynet Command gets the new icon: the app folder, Desktop, Start menu and pinned taskbar. Then Windows' icon cache is refreshed.
+
+## v26: exact in-game German stratagem names
+- The German profile now uses the real names from the German version of the game, e.g. **Adler – Luftschlag**, **Orbital-Präzisionsschlag**, **EAT-17-Einmal-Panzerabwehr**, **ARC-3-Bogenwerfer**, **M-102-Schnelles Aufklärungsfahrzeug**.
+- The exact name is the command's name and its first phrase. All the old German phrases and names still work too.
+- Your existing German profile is upgraded automatically. Your own phrases, changed macros and on/off settings are kept, and your usage counts follow the new names.
+- 91 stratagems have their exact name. 25 had no German source (mission objectives, Eagle Rearm, Orbital Napalm, Eagle Gas, Meltagun, Grenadier Battlement, Gas Mines, the Supply and Incinerator FRV, Maelstrom, Bastion), so they keep their previous German names. Rename them in the app if your game shows something else.
+
+## v25: separate English and German Helldivers 2 profiles
+- The German profile is now called **Helldivers 2 (Deutsch)** (`profiles_de/Helldivers 2 _Deutsch_.json`); the English one stays **Helldivers 2** in `profiles/`.
+- Each one has its own usage counters (x5 / x10). Your old German counts were moved over automatically and your taught phrases were kept.
+- Each language remembers its own last-used profile (`profile` / `profile_de` in settings.json).
+- Your overall total and rank are still shared, because they belong to you, not to a profile.
+
+## v24: hear how to say a command
+- Every row has a small **speaker** (right end of WHEN I SAY): click it and the command is read aloud in a clear, natural voice (no robot effect) - its name, then the phrases you can say. Also the **♪ HEAR** button for the selected command.
+- OPTIONS → SOUND → **PRONUNCIATION SPEED**: slow (default, for learning) / normal. Works even when the Skynet voice is off.
+- In German it uses a German Windows voice. If none is installed the log says how to add one (Windows Settings → Time & language → Speech → Manage voices → Add voices → Deutsch).
+
+## v23: full German interface
+- COMMAND LANGUAGE **deutsch** now switches the whole interface to German too: every label, button tooltip, option and hint, the command editor, profile window, combo / rank panel (KOMBO, GESAMT, BESTE, ST, EP, German rank names), header status (WARTET, IM SPIEL, GESPERRT …), key names (STRG LINKS, UMSCHALT, LEERTASTE …), pop-up questions and every log message. English mode is unchanged.
+- One translation table (`DE` + `DE_RULES` for messages with names / numbers) and `tr()`; in German mode every label, canvas text, tooltip, title and message box goes through it.
+- Fixed: the app did not start after v21 (the combo panel's code had been split by the rank side tab).
+
+## v22: Deutsch (German commands)
+- OPTIONS → LOOK → **COMMAND LANGUAGE**: english / deutsch (restarts by itself, like the themes).
+- **Deutsch** uses its own profile folder `profiles_de` - a German Helldivers 2 profile (German names + phrases for all 116 stratagems, e.g. "Höllenbombe", "Orbitaler Laser", "Adler-500-kg-Bombe", "Nachschub", plus the code names like "TD-220"). Your English profiles in `profiles` are never touched or mixed in.
+- Whisper listens in German (multilingual model: large-v3-turbo on the GPU, small on the CPU), German filler words ("bitte", "äh", "jetzt" …) are ignored, Whisper's typical German silence phantoms ("Untertitel im Auftrag des ZDF", "Danke") are filtered.
+- The voice speaks German if Windows has a German voice installed ("Zuhören aktiv." · Blackwatch: "Verstanden. Höllenbombe." / "Funk online. Bereit.").
+- Fixed: the Windows speech script for the robot / suit / radio voice had been removed by mistake in v14 - spoken confirmations work again.
+
+## v21: Blackwatch theme
+- OPTIONS → LOOK → THEME: **BLACKWATCH** - black + military yellow, blue goggle-lens eye, faint tactical grid background (a target box moves between frames).
+- Radio-comms sounds: squelch clicks, static bursts, roger beeps, key-up / squelch-tail push-to-talk (sounds b1_).
+- **RADIO VOICE**: lines go through a field-radio filter (narrow band, compressed, static, squelch at start and end) and are radio-style: "Copy. Hellbomb." · "Comms online. Standing by." · "Comms offline."
+- Ranks in this theme follow the Blackwatch chain of command: RECRUIT → FOOT SOLDIER → SPECTRE → SPECTRE SGT → FIELD OFFICER → LIEUTENANT → COMMANDER → COLONEL → ORION SOLDIER → GENERAL (each I-V, 50 total). Your XP is shared between themes.
+
+## v20: combo counter, use counters, 50 ranks
+- Every command row shows how often you used it: an **xN** badge on the left (flashes when it fires; brighter from x10, glowing from x50).
+- Panel above the COMMAND LOG: **COMBO xN** (successful commands in a row - a miss, a "game not in front" or 2 minutes without a command breaks it; the bar under it drains), **TOTAL** successful commands, **BEST** combo, and your **rank**.
+- **50 ranks** (RECRUIT I → OVERLORD V), 1 XP per successful command: 4 XP for level 2 … about 2,000 for level 50. Rank-ups and every x5 combo flash a banner with a sound.
+- Kept in `stats.json` (counts per profile + command). Test presses don't count.
+- Click your **rank** (right part of the combo panel) and the rank board slides in as a side tab of the main window: all 50 ranks, done ✔, yours (◀ YOU), the XP each needs and how many commands to the next rank. Click the rank again, ✕ or Esc to slide it away.
+
+## v19: themes - Skynet + Nano
+- OPTIONS → LOOK → **THEME**: **SKYNET** (red machine HUD, TV static, Terminator-style sounds, cold machine voice) or **NANO** (pale-mint suit HUD with hex armour cells, nanosuit-style sounds: crisp digital blips, chirps, air whooshes, power-up / power-down swells, smoother suit voice). The app restarts by itself to switch.
+- Every colour of the app follows the theme (fixed colours are translated by `T()`); each theme keeps its own sound files (v6_ / n1_) and voice cache.
 
 ## v18: credit
 - The card also says **THIS APP IS FREE - IT CANNOT BE SOLD**, and the log says it at start.

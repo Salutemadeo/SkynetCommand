@@ -5,13 +5,14 @@ Profiles are plain JSON files in ./profiles (one per game)."""
 import os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+ICON_VER = 5   # bump when the icon changes -> new .ico file name + shortcuts updated
 PORTABLE = os.path.isdir(os.path.join(ROOT, "runtime", "python"))   # shared package: own Python in ..\runtime, models in ..\models
 if PORTABLE: os.environ.setdefault("HF_HOME", os.path.join(ROOT, "models"))    # speech models stay inside the app folder
 LOG_DIR = os.path.join(HERE, "logs"); os.makedirs(LOG_DIR, exist_ok=True)
 if sys.stderr is None or sys.executable.lower().endswith("pythonw.exe"):
     sys.stderr = open(os.path.join(LOG_DIR, "app-errors.txt"), "a", encoding="utf-8", buffering=1)
 
-import ctypes, json, math, queue, random, re, subprocess, threading, time, traceback, zlib, difflib
+import ctypes, json, math, queue, random, re, shutil, subprocess, threading, time, traceback, zlib, difflib
 import xml.etree.ElementTree as ET
 from collections import deque
 WIN = os.name == "nt"
@@ -27,6 +28,12 @@ except ImportError:  # double-clicked with the wrong Python -> restart with the 
 if WIN and __name__ == "__main__":
     _k32 = ctypes.windll.kernel32
     _MUTEX = _k32.CreateMutexW(None, False, "SkynetCommand_SingleInstance")
+    if _k32.GetLastError() == 183 and "--restart" in sys.argv:          # theme switch: wait until the old window has closed
+        import time as _t
+        for _ in range(80):
+            _k32.CloseHandle(_MUTEX); _t.sleep(0.1)
+            _MUTEX = _k32.CreateMutexW(None, False, "SkynetCommand_SingleInstance")
+            if _k32.GetLastError() != 183: break
     if _k32.GetLastError() == 183:
         _h = ctypes.windll.user32.FindWindowW(None, "SKYNET COMMAND")
         if _h: ctypes.windll.user32.ShowWindow(_h, 9); ctypes.windll.user32.SetForegroundWindow(_h)
@@ -45,23 +52,78 @@ for _base in dict.fromkeys([sys.prefix, os.path.join(HERE, "venv"), os.path.join
             except Exception: pass
             os.environ["PATH"] = _bin + os.pathsep + os.environ.get("PATH", "")
 
-PROFILE_DIR = os.path.join(HERE, "profiles"); os.makedirs(PROFILE_DIR, exist_ok=True)
-SFX_DIR = os.path.join(HERE, "sfx"); os.makedirs(SFX_DIR, exist_ok=True)
 SETTINGS_FILE = os.path.join(HERE, "settings.json")
+
+
+def _read_setting(key, default):
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f: return json.load(f).get(key, default)
+    except Exception: return default
+
+
+APP_LANG = "de" if _read_setting("app_lang", "en") == "de" else "en"      # Deutsch = own profiles, German speech + voice
+PROFILE_DIR = os.path.join(HERE, "profiles_de" if APP_LANG == "de" else "profiles"); os.makedirs(PROFILE_DIR, exist_ok=True)   # never mixed
+HD2_NAME = "Helldivers 2 (Deutsch)" if APP_LANG == "de" else "Helldivers 2"     # the two HD2 profiles have their own names -> own counters
+PROF_KEY = "profile_de" if APP_LANG == "de" else "profile"                       # each language remembers its own last profile
+SFX_DIR = os.path.join(HERE, "sfx"); os.makedirs(SFX_DIR, exist_ok=True)
+ICON_DIR = os.path.join(HERE, "icons", "hd2")       # stratagem icons: sheet_26.png / sheet_56.png + icons.json (arrow code -> cell), shown if present
 SR = 16000
 
-BG, PANEL, GRID = "#06070A", "#0D0F14", "#1B1F28"
-RED, RED_DIM, ORANGE, WHITE, DIM = "#FF3131", "#5A1414", "#FF8A1F", "#F2F2F2", "#666B78"
-GREEN = "#46F08A"
+# ---------------- themes ----------------
+# skynet = red machine HUD · nano = pale-mint suit HUD with hex cells (picked in OPTIONS → THEME; the app restarts to apply)
+def _read_theme():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f: t = json.load(f).get("theme", "skynet")
+        return t if t in ("skynet", "nano", "blackwatch") else "skynet"
+    except Exception: return "skynet"
+
+
+THEME = _read_theme()
+if THEME == "nano":
+    BG, PANEL, GRID = "#070B09", "#0C1311", "#1A2A23"
+    RED, RED_DIM, ORANGE, WHITE, DIM = "#8FE6B4", "#24493A", "#D6FFE6", "#E4FFF0", "#5E7D6E"
+    GREEN = "#8EE8FF"
+elif THEME == "blackwatch":       # black + military yellow, blue goggle-lens accents
+    BG, PANEL, GRID = "#08080A", "#0F0F11", "#2A2720"
+    RED, RED_DIM, ORANGE, WHITE, DIM = "#F2B705", "#5C4810", "#FFE27A", "#EEEADF", "#7D776A"
+    GREEN = "#5EC8FF"
+else:
+    BG, PANEL, GRID = "#06070A", "#0D0F14", "#1B1F28"
+    RED, RED_DIM, ORANGE, WHITE, DIM = "#FF3131", "#5A1414", "#FF8A1F", "#F2F2F2", "#666B78"
+    GREEN = "#46F08A"
+_TCACHE = {}
+
+
+def T(c):
+    """a fixed colour of the Skynet look, translated to the current theme
+    (nano: reds -> mint, oranges -> pale glow, greys -> green-grey · blackwatch: reds -> military yellow, greys -> warm black)"""
+    if THEME == "skynet": return c
+    r = _TCACHE.get(c)
+    if r: return r
+    import colorsys
+    rr, gg, bb = (int(c[i:i + 2], 16) / 255 for i in (1, 3, 5)); h, l, s = colorsys.rgb_to_hls(rr, gg, bb)
+    if THEME == "blackwatch":
+        if s < 0.14 or 0.5 <= h <= 0.9: h, s = 0.12, min(0.12, s)                 # greys -> neutral warm black
+        elif h > 0.9 or h < 0.045: h, s, l = 0.125, s * 0.9, min(0.85, l * 1.1)   # red -> military yellow
+        elif h < 0.17: h, s, l = 0.13, s * 0.8, min(0.9, l * 1.2)                 # orange -> bright yellow
+        elif 0.2 < h < 0.5: h = 0.56                                               # green -> goggle blue
+        r = "#%02X%02X%02X" % tuple(int(round(v * 255)) for v in colorsys.hls_to_rgb(h, l, s)); _TCACHE[c] = r
+        return r
+    if s < 0.14 or 0.5 <= h <= 0.9: h, s = 0.42, min(0.25, s + 0.1)     # neutral / blue-ish greys -> faint green-grey
+    elif h > 0.9 or h < 0.045: h, s, l = 0.41, s * 0.45, min(0.9, l * 1.05)   # red -> mint
+    elif h < 0.17: h, s, l = 0.39, s * 0.35, min(0.93, l * 1.2)          # orange / amber -> pale glow
+    elif 0.2 < h < 0.5: h = 0.53                                          # green -> cyan
+    r = "#%02X%02X%02X" % tuple(int(round(v * 255)) for v in colorsys.hls_to_rgb(h, l, s)); _TCACHE[c] = r
+    return r
 MONO = "Consolas"
 
 DEFAULTS = {
-    "profile": "Helldivers 2", "mic": "", "model": "auto", "device": "auto", "language": "English",
+    "listen_src": "all", "src_ver": 1, "speaker_dev": "", "profile": "Helldivers 2", "profile_de": "Helldivers 2 (Deutsch)", "mic": "", "model": "auto", "device": "auto", "language": "English",
     "mode": "always", "ptt_key": "mouse4", "toggle_key": "ctrl+alt+m", "sensitivity": 5, "silence_ms": 380,
     "threshold": 0.78, "bias": True, "focus_only": True, "auto_switch": True, "sounds": True, "voice": True,
     "listening": True, "ai_on": True, "ontop": False, "geometry": "", "key_ms": 60,
     "volume": 70, "ui_sounds": True, "ptt_sounds": True, "fail_sound": "ptt only", "confirm_voice": False,
-    "ai_load": "balanced", "gpu_mem": "saver", "cpu_threads": 4, "game_first": True, "pause_anim": True, "max_age": 3.0,
+    "theme": "skynet", "app_lang": "en", "say_rate": "slow", "ai_load": "balanced", "gpu_mem": "saver", "cpu_threads": 4, "game_first": True, "pause_anim": True, "max_age": 3.0,
 }
 MODEL_CHOICES = ["auto", "distil-small.en", "small.en", "base.en", "distil-medium.en", "medium.en", "large-v3-turbo", "distil-large-v3", "tiny.en", "small", "medium"]
 DEFAULT_MIC = "(Windows default microphone)"
@@ -387,8 +449,10 @@ TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
 UNITS = {"kilogram": "kg", "kilograms": "kg", "kilo": "kg", "kilos": "kg", "kgs": "kg", "millimeter": "mm",
          "millimeters": "mm", "millimetre": "mm", "millimetres": "mm"}
 JUNK = {"thank you", "thanks", "thanks for watching", "thank you for watching", "thank you very much", "you", "bye", "bye bye",
-        "okay", "ok", "yeah", "yes", "no", "hmm", "uh", "oh", "subtitles by the amara org community"}   # Whisper's favourite noise words
-FILLER = {"uh", "um", "uhm", "umm", "er", "erm", "ah", "hmm", "please", "okay", "ok", "the"}
+        "okay", "ok", "yeah", "yes", "no", "hmm", "uh", "oh", "subtitles by the amara org community", "danke", "vielen dank", "danke schön", "tschüss", "untertitel im auftrag des zdf", "untertitelung im auftrag des zdf",
+        "untertitel der amara org community", "untertitel von stephanie geiges", "bis zum nächsten mal"}   # Whisper's favourite noise words
+FILLER = {"uh", "um", "uhm", "umm", "er", "erm", "ah", "hmm", "please", "okay", "ok", "the",
+          "äh", "ähm", "öh", "hm", "bitte", "mal", "jetzt", "los", "schnell", "der", "die", "das", "den", "dem", "ein", "eine", "einen"}
 
 
 def num_words(n):
@@ -657,6 +721,8 @@ def say_number(n):
 
 def split_code(name):
     """'TD-220 Bastion MK XVI' -> ('TD-220', 'Bastion MK XVI'); names without a code -> ('', name)"""
+    m = re.match(r"^([A-Za-z]+(?:/[A-Za-z]+)?-[A-Za-z]*\d[A-Za-z0-9]*)-(\S.*)$", name)   # German style 'MG-43-Maschinengewehr'
+    if m: return m[1], m[2]
     first, _, rest = name.partition(" ")
     if rest and re.search(r"\d", first) and re.search(r"[-/]", first): return first, rest
     return "", name
@@ -691,10 +757,215 @@ def hd2_commands():
              for n, cat, ph in HD2_NO_CODE])
 
 
+# German names + phrases for every Helldivers 2 stratagem (used only by the Deutsch language - never mixed with English)
+HD2_DE = {
+    "Reinforce": ("Verstärkung", "verstärkung;wiederbeleben;respawn"),
+    "SOS Beacon": ("SOS-Signal", "SOS;notsignal;SOS signal"),
+    "Resupply": ("Nachschub", "nachschub;munition;versorgung"),
+    "NUX-223 Hellbomb": ("NUX-223 Höllenbombe", "höllenbombe;hellbombe"),
+    "Eagle Rearm": ("Adler neu aufmunitionieren", "adler aufmunitionieren;adler nachladen;aufmunitionieren"),
+    "SEAF Artillery": ("SEAF-Artillerie", "artillerie;SEAF artillerie"),
+    "Super Earth Flag": ("Super-Erde-Flagge", "flagge;super erde flagge"),
+    "Upload Data": ("Daten hochladen", "daten hochladen;hochladen"),
+    "SSSD Delivery": ("SSSD-Lieferung", "SSSD;festplatte;SSSD lieferung"),
+    "Seismic Probe": ("Seismische Sonde", "seismische sonde;sonde"),
+    "Prospecting Drill": ("Prospektionsbohrer", "prospektionsbohrer;erkundungsbohrer"),
+    "Hive Breaker Drill": ("Nestbrecher-Bohrer", "nestbrecher;nestbrecher bohrer"),
+    "Tectonic Drill": ("Tektonischer Bohrer", "tektonischer bohrer"),
+    "Aquifer Drill": ("Grundwasserbohrer", "grundwasserbohrer;aquiferbohrer"),
+    "Dark Fluid Vessel": ("Dunkelflüssigkeitsbehälter", "dunkle flüssigkeit;dunkelflüssigkeit"),
+    "Cargo Container": ("Frachtcontainer", "frachtcontainer;container"),
+    "Tactical Video Camera": ("Taktische Videokamera", "videokamera;taktische kamera"),
+    "Reinforcement Pods": ("Verstärkungskapseln", "verstärkungskapseln;kapseln"),
+    "Activate E-711 Extraction Drill": ("E-711 Förderbohrer aktivieren", "förderbohrer;bohrer aktivieren;E711"),
+    "Portable Comms Relay": ("Tragbares Funkrelais", "funkrelais;tragbares funkrelais"),
+    "Call In Super Destroyer": ("Super-Zerstörer rufen", "super zerstörer;zerstörer rufen"),
+    "Orbital Precision Strike": ("Orbitaler Präzisionsschlag", "präzisionsschlag;orbitaler präzisionsschlag"),
+    "Orbital Gatling Barrage": ("Orbitales Gatling-Sperrfeuer", "gatling sperrfeuer;orbitales gatling"),
+    "Orbital Gas Strike": ("Orbitaler Gasschlag", "gasschlag;orbitaler gasschlag"),
+    "Orbital 120mm HE Barrage": ("Orbitales 120-mm-Sperrfeuer", "120 sperrfeuer;hundertzwanzig sperrfeuer;120 mm sperrfeuer"),
+    "Orbital Airburst Strike": ("Orbitaler Luftsprengschlag", "luftsprengschlag;luftsprengung"),
+    "Orbital Smoke Strike": ("Orbitaler Rauchschlag", "orbitaler rauch;rauchschlag"),
+    "Orbital EMS Strike": ("Orbitaler EMS-Schlag", "EMS schlag;orbitaler EMS"),
+    "Orbital 380mm HE Barrage": ("Orbitales 380-mm-Sperrfeuer", "380 sperrfeuer;dreihundertachtzig sperrfeuer;380 mm sperrfeuer"),
+    "Orbital Walking Barrage": ("Orbitales Wandersperrfeuer", "wandersperrfeuer;wanderndes sperrfeuer"),
+    "Orbital Laser": ("Orbitaler Laser", "laser;orbitaler laser;orbitallaser"),
+    "Orbital Napalm Barrage": ("Orbitales Napalm-Sperrfeuer", "napalm sperrfeuer;orbitales napalm"),
+    "Orbital Railcannon Strike": ("Orbitaler Schienenkanonenschlag", "schienenkanone;railkanone"),
+    "Eagle Strafing Run": ("Adler-Tiefflugangriff", "tiefflug;tiefflugangriff;adler tiefflug"),
+    "Eagle Airstrike": ("Adler-Luftschlag", "luftschlag;luftangriff;adler luftschlag"),
+    "Eagle Cluster Bomb": ("Adler-Streubombe", "streubombe;adler streubombe"),
+    "Eagle Napalm Airstrike": ("Adler-Napalmangriff", "napalm;adler napalm"),
+    "Eagle Smoke Strike": ("Adler-Rauchschlag", "adler rauch"),
+    "Eagle 110mm Rocket Pods": ("Adler-110-mm-Raketenwerfer", "raketen;raketenkapseln;110 mm raketen"),
+    "Eagle 500kg Bomb": ("Adler-500-kg-Bombe", "500 kg;500 kg bombe;fünfhundert kilo;große bombe"),
+    "Eagle Gas Airstrike": ("Adler-Gasangriff", "adler gas;gasangriff"),
+    "MG-43 Machine Gun": ("MG-43 Maschinengewehr", "maschinengewehr;MG"),
+    "EAT-17 Expendable Anti-Tank": ("EAT-17 Einweg-Panzerabwehr", "einweg panzerabwehr;EAT;panzerfaust"),
+    "M-105 Stalwart": ("M-105 Stalwart", "stalwart;leichtes MG"),
+    "LAS-98 Laser Cannon": ("LAS-98 Laserkanone", "laserkanone"),
+    "APW-1 Anti-Materiel Rifle": ("APW-1 Anti-Material-Gewehr", "scharfschützengewehr;anti material gewehr;sniper"),
+    "GL-21 Grenade Launcher": ("GL-21 Granatwerfer", "granatwerfer"),
+    "GR-8 Recoilless Rifle": ("GR-8 Rückstoßfreies Gewehr", "rückstoßfrei;rückstoßfreies gewehr"),
+    "FLAM-40 Flamethrower": ("FLAM-40 Flammenwerfer", "flammenwerfer"),
+    "MG-206 Heavy Machine Gun": ("MG-206 Schweres Maschinengewehr", "schweres maschinengewehr;schweres MG"),
+    "AC-8 Autocannon": ("AC-8 Maschinenkanone", "maschinenkanone;autokanone"),
+    "ARC-3 Arc Thrower": ("ARC-3 Lichtbogenwerfer", "lichtbogenwerfer;blitzwerfer"),
+    "LAS-99 Quasar Cannon": ("LAS-99 Quasarkanone", "quasar;quasarkanone"),
+    "RL-77 Airburst Rocket Launcher": ("RL-77 Luftspreng-Raketenwerfer", "luftspreng raketenwerfer;luftsprengwerfer"),
+    "MLS-4X Commando": ("MLS-4X Kommando", "kommando"),
+    "FAF-14 Spear": ("FAF-14 Speer", "speer"),
+    "RS-422 Railgun": ("RS-422 Railgun", "railgun;schienengewehr"),
+    "StA-X3 W.A.S.P. Launcher": ("StA-X3 W.A.S.P.-Werfer", "wespe;wasp werfer"),
+    "CQC-20 Breaching Hammer": ("CQC-20 Brechhammer", "brechhammer;hammer"),
+    "PLAS-45 Epoch": ("PLAS-45 Epoch", "epoch;epoche"),
+    "MGX-42 Bullet Storm": ("MGX-42 Kugelsturm", "kugelsturm"),
+    "TX-41 Sterilizer": ("TX-41 Sterilisator", "sterilisator"),
+    "S-11 Speargun": ("S-11 Harpune", "harpune;speerkanone"),
+    "CQC-9 Defoliation Tool": ("CQC-9 Entlaubungswerkzeug", "entlaubungswerkzeug;kettensäge"),
+    "GL-52 De-Escalator": ("GL-52 Deeskalator", "deeskalator"),
+    "EAT-700 Expendable Napalm": ("EAT-700 Einweg-Napalm", "einweg napalm;napalm werfer"),
+    "EAT-411 Leveller": ("EAT-411 Planierer", "planierer;leveller"),
+    "M-1000 Maxigun": ("M-1000 Maxigun", "maxigun;minigun"),
+    "GL-28 Belt-Fed Grenade Launcher": ("GL-28 Gurtgranatwerfer", "gurtgranatwerfer;gurt granatwerfer"),
+    "B/FLAM-80 Cremator": ("B/FLAM-80 Krematorium", "krematorium;kremator"),
+    "MS-11 Solo Silo": ("MS-11 Solo-Silo", "solo silo;silo"),
+    "40-K Meltagun": ("40-K Melter", "melter;schmelzgewehr"),
+    "B/MD C4 Pack": ("B/MD C4-Paket", "C4;sprengladung"),
+    "CQC-1 One True Flag": ("CQC-1 Die Wahre Flagge", "wahre flagge;die wahre flagge"),
+    "B-1 Supply Pack": ("B-1 Versorgungsrucksack", "versorgungsrucksack;nachschubrucksack"),
+    "LIFT-850 Jump Pack": ("LIFT-850 Sprungrucksack", "sprungrucksack;jetpack"),
+    "LIFT-860 Hover Pack": ("LIFT-860 Schweberucksack", "schweberucksack"),
+    "LIFT-182 Warp Pack": ("LIFT-182 Warp-Rucksack", "warp rucksack;warprucksack"),
+    "B-100 Portable Hellbomb": ("B-100 Tragbare Höllenbombe", "tragbare höllenbombe;rucksack höllenbombe"),
+    "SH-20 Ballistic Shield Backpack": ("SH-20 Ballistischer Schild", "ballistischer schild;schutzschild"),
+    "SH-32 Shield Generator Pack": ("SH-32 Schildgenerator-Rucksack", "schildrucksack;schildgenerator"),
+    "SH-51 Directional Shield": ("SH-51 Richtungsschild", "richtungsschild"),
+    "AX/AR-23 Guard Dog": ("AX/AR-23 Wachhund", "wachhund"),
+    "AX/LAS-5 Rover": ("AX/LAS-5 Rover", "rover;laserhund"),
+    "AX/TX-13 Dog Breath": ("AX/TX-13 Hundeatem", "hundeatem;gashund"),
+    "AX/FLAM-75 Hot Dog": ("AX/FLAM-75 Feuerhund", "feuerhund;flammenhund"),
+    "AX/ARC-3 K-9": ("AX/ARC-3 K-9", "K9;blitzhund"),
+    "A/MG-43 Machine Gun Sentry": ("A/MG-43 MG-Geschütz", "MG geschütz;maschinengewehr geschütz"),
+    "A/G-16 Gatling Sentry": ("A/G-16 Gatling-Geschütz", "gatling geschütz"),
+    "A/M-12 Mortar Sentry": ("A/M-12 Mörsergeschütz", "mörser;mörsergeschütz"),
+    "A/AC-8 Autocannon Sentry": ("A/AC-8 Maschinenkanonen-Geschütz", "maschinenkanonen geschütz;autokanonen geschütz"),
+    "A/MLS-4X Rocket Sentry": ("A/MLS-4X Raketengeschütz", "raketengeschütz"),
+    "A/M-23 EMS Mortar Sentry": ("A/M-23 EMS-Mörser", "EMS mörser"),
+    "A/ARC-3 Tesla Tower": ("A/ARC-3 Teslaturm", "tesla;teslaturm"),
+    "A/FLAM-40 Flame Sentry": ("A/FLAM-40 Flammengeschütz", "flammengeschütz"),
+    "A/GM-17 Gas Mortar Sentry": ("A/GM-17 Gasmörser", "gasmörser"),
+    "A/LAS-98 Laser Sentry": ("A/LAS-98 Lasergeschütz", "lasergeschütz"),
+    "E/MG-101 HMG Emplacement": ("E/MG-101 HMG-Stellung", "HMG stellung;schwere MG stellung"),
+    "E/AT-12 Anti-Tank Emplacement": ("E/AT-12 Panzerabwehrstellung", "panzerabwehrstellung;panzerabwehr stellung"),
+    "E/GL-21 Grenadier Battlement": ("E/GL-21 Grenadier-Bollwerk", "grenadier;grenadier bollwerk"),
+    "FX-12 Shield Generator Relay": ("FX-12 Schildgenerator-Relais", "schildrelais;schildkuppel"),
+    "MD-6 Anti-Personnel Minefield": ("MD-6 Antipersonen-Minenfeld", "minenfeld;minen"),
+    "MD-I4 Incendiary Mines": ("MD-I4 Brandminen", "brandminen"),
+    "MD-17 Anti-Tank Mines": ("MD-17 Panzerabwehrminen", "panzerminen;panzerabwehrminen"),
+    "MD-8 Gas Mines": ("MD-8 Gasminen", "gasminen"),
+    "EXO-45 Patriot Exosuit": ("EXO-45 Patriot-Exoanzug", "patriot;mech;exoanzug"),
+    "EXO-49 Emancipator Exosuit": ("EXO-49 Emanzipator-Exoanzug", "emanzipator;emancipator"),
+    "EXO-51 Lumberer Exosuit": ("EXO-51 Holzfäller-Exoanzug", "holzfäller;lumberer"),
+    "EXO-55 Breakthrough Exosuit": ("EXO-55 Durchbruch-Exoanzug", "durchbruch"),
+    "M-102 Gunner FRV": ("M-102 Schützen-FRV", "schützen fahrzeug;gunner fahrzeug"),
+    "M-103 Supply FRV": ("M-103 Versorgungs-FRV", "versorgungsfahrzeug;nachschubfahrzeug"),
+    "M-104 Incinerator FRV": ("M-104 Verbrenner-FRV", "verbrenner fahrzeug;flammenfahrzeug"),
+    "TD-110 Maelstrom": ("TD-110 Mahlstrom", "mahlstrom;mahlstrom panzer"),
+    "TD-220 Bastion MK XVI": ("TD-220 Bastion MK XVI", "bastion;bastion panzer"),
+    "AMW-20 Apex": ("AMW-20 Apex", "apex"),
+    "LAS-44 Nova": ("LAS-44 Nova", "nova"),
+}
+# the exact in-game German names (Taktikausrüstung), from German sources: Eurogamer.de code list, PlayStation Blog DE warbond posts, mein-mmo
+# stratagems not listed here had no German source found and keep the names above
+HD2_DE_OFFICIAL = {
+    "SOS Beacon": "SOS-Bake", "NUX-223 Hellbomb": "NUX-223 Hellbombe", "Super Earth Flag": "Über-Erde-Flagge", "Upload Data": "Datenupload",
+    "SEAF Artillery": "S.E.A.F.-Artillerie",
+    "Orbital Precision Strike": "Orbital-Präzisionsschlag", "Orbital Gatling Barrage": "Gatling-Orbitalsperrfeuer", "Orbital Gas Strike": "Orbital-Gasangriff",
+    "Orbital 120mm HE Barrage": "120-MM-HE-Orbitalsperrfeuer", "Orbital Airburst Strike": "Orbital-Luftstoßangriff", "Orbital Smoke Strike": "Orbital-Rauchbeschuss",
+    "Orbital EMS Strike": "Orbital-EMS-Feuer", "Orbital 380mm HE Barrage": "380-MM-HE-Orbitalsperrfeuer", "Orbital Walking Barrage": "Lineares Orbitalsperrfeuer",
+    "Orbital Laser": "Orbital-Laser", "Orbital Railcannon Strike": "Orbital-Schienenkanonen-Schlag",
+    "Eagle Strafing Run": "Adler – Tieffliegerangriff", "Eagle Airstrike": "Adler – Luftschlag", "Eagle Cluster Bomb": "Adler – Streubombe",
+    "Eagle Napalm Airstrike": "Adler – Napalmluftschlag", "Eagle Smoke Strike": "Adler – Rauchbeschuss", "Eagle 110mm Rocket Pods": "Adler – 110-MM-Raketen-Pods",
+    "Eagle 500kg Bomb": "Adler – 500-KG-Bombe",
+    "MG-43 Machine Gun": "MG-43-Maschinengewehr", "EAT-17 Expendable Anti-Tank": "EAT-17-Einmal-Panzerabwehr", "M-105 Stalwart": "M-105-Stalwart",
+    "LAS-98 Laser Cannon": "LAS-98-Laserkanone", "APW-1 Anti-Materiel Rifle": "APW-1-Anti-Materie-Gewehr", "GL-21 Grenade Launcher": "GL-21-Granatwerfer",
+    "GR-8 Recoilless Rifle": "GR-8-Rückstoßfreies Gewehr", "FLAM-40 Flamethrower": "FLAM-40-Flammenwerfer", "MG-206 Heavy Machine Gun": "MG-206-Schweres Maschinengewehr",
+    "AC-8 Autocannon": "AC-8-Automatische Kanone", "ARC-3 Arc Thrower": "ARC-3-Bogenwerfer", "LAS-99 Quasar Cannon": "LAS-99-Quasarkanone",
+    "RL-77 Airburst Rocket Launcher": "RL-77-Luftdetonations-Raketenwerfer", "MLS-4X Commando": "MLS-4X-Kommando", "FAF-14 Spear": "FAF-14-Speer",
+    "RS-422 Railgun": "RS-422-Railgun", "StA-X3 W.A.S.P. Launcher": "StA-X3 W.A.S.P.-Werfer", "CQC-20 Breaching Hammer": "CQC-20-Durchbruchhammer",
+    "MGX-42 Bullet Storm": "MGX-42-Kugel-Sturm", "TX-41 Sterilizer": "TX-41-Sterilisierer", "S-11 Speargun": "S-11-Harpune",
+    "CQC-9 Defoliation Tool": "CQC-9-Entlaubungswerkzeug", "GL-52 De-Escalator": "GL-52-De-Escalator", "EAT-700 Expendable Napalm": "EAT-700-Einmal-Napalm",
+    "EAT-411 Leveller": "EAT-411-Nivellierer", "M-1000 Maxigun": "M-1000-Maxigun", "GL-28 Belt-Fed Grenade Launcher": "GL-28-Munitionsgurt-Granatwerfer",
+    "B/FLAM-80 Cremator": "B/FLAM-80-Kremator", "MS-11 Solo Silo": "MS-11-Einzel-Silo", "B/MD C4 Pack": "B/MD-C4-Paket",
+    "CQC-1 One True Flag": "CQC-1-„Die einzig wahre Flagge“",
+    "B-1 Supply Pack": "B-1-Vorratspaket", "LIFT-850 Jump Pack": "LIFT-850-Sprungpaket", "LIFT-860 Hover Pack": "LIFT-860-Hover-Paket",
+    "LIFT-182 Warp Pack": "LIFT-182-Warp-Paket", "B-100 Portable Hellbomb": "B-100-Höllenbombe",
+    "SH-20 Ballistic Shield Backpack": "SH-20-„Ballistischer Schild“-Rucksack", "SH-32 Shield Generator Pack": "SH-32-Schildgenerator-Rucksack",
+    "SH-51 Directional Shield": "SH-51-Richtungsschild",
+    "AX/AR-23 Guard Dog": "AX/AR-23-„Guard Dog“", "AX/LAS-5 Rover": "AX/LAS-5-„Guard Dog“-Rover", "AX/TX-13 Dog Breath": "AX/TX-13-„Guard Dog“-Hundeatem",
+    "AX/FLAM-75 Hot Dog": "AX/FLAM-75-„Guard Dog“-Hotdog", "AX/ARC-3 K-9": "AX/ARC-3-„Guard Dog“-K-9",
+    "A/MG-43 Machine Gun Sentry": "A/MG-43-MG-Geschütz", "A/G-16 Gatling Sentry": "A/G-16-Gatlinggeschütz", "A/M-12 Mortar Sentry": "A/M-12-Mörsergeschütz",
+    "A/AC-8 Autocannon Sentry": "A/AC-8-Automatisches Kanonengeschütz", "A/MLS-4X Rocket Sentry": "A/MLS-4X-Raketengeschütz",
+    "A/M-23 EMS Mortar Sentry": "A/M-23-EMS-Mörsergeschütz", "A/ARC-3 Tesla Tower": "A/ARC-3-Tesla-Turm", "A/FLAM-40 Flame Sentry": "A/FLAM-40-Flammengeschütz",
+    "A/GM-17 Gas Mortar Sentry": "A/GM-17-Gas-Mörsergeschütz", "A/LAS-98 Laser Sentry": "A/LAS-98-Lasergeschütz",
+    "E/MG-101 HMG Emplacement": "E/MG-101-Schwere MG-Stellung", "E/AT-12 Anti-Tank Emplacement": "E/AT-12-Panzerabwehrstellung",
+    "FX-12 Shield Generator Relay": "FX-12-Schildgenerator-Relais",
+    "MD-6 Anti-Personnel Minefield": "MD-6-Anti-Personen-Minenfeld", "MD-I4 Incendiary Mines": "MD-I4-Brandminen", "MD-17 Anti-Tank Mines": "MD-17-Panzerabwehrminen",
+    "EXO-45 Patriot Exosuit": "EXO-45-Patriot-Exoanzug", "EXO-49 Emancipator Exosuit": "EXO-49-Emancipator-Exoanzug",
+    "EXO-51 Lumberer Exosuit": "EXO-51 Fäller", "EXO-55 Breakthrough Exosuit": "EXO-55 Durchbruch",
+    "M-102 Gunner FRV": "M-102-Schnelles Aufklärungsfahrzeug",
+    "PLAS-45 Epoch": "PLAS-45 Epoch", "AMW-20 Apex": "AMW-20-Apex", "LAS-44 Nova": "LAS-44-Nova",
+}
+HD2_DE_NAMES = 2   # bump when the German names change -> old German profiles get renamed (your phrases + macros are kept)
+
+
+def hd2_de_entry(n):
+    """English stratagem -> (exact German name, phrases with the exact name first, the old German name)"""
+    de, ph = HD2_DE.get(n, (n, ""))
+    off = HD2_DE_OFFICIAL.get(n, de)
+    ocode, ofull = split_code(off); dcode, dfull = split_code(de)
+    first = [off] + ([ofull] if len(ofull) > 6 else []) + ([ocode] if ocode and len(re.sub(r"[^A-Za-z0-9]", "", ocode)) > 2 else [])
+    rest = ph.split(";") + [dfull, de] + ([dcode] if dcode and len(re.sub(r"[^A-Za-z0-9]", "", dcode)) > 2 else [])
+    return off, _dedup(first + rest), de
+GROUP_DE = {"General": "Allgemein", "Mission": "Mission", "Orbital": "Orbital", "Eagle": "Adler", "Weapons": "Waffen", "Backpacks": "Rucksäcke",
+            "Sentries": "Geschütze", "Emplacements": "Stellungen", "Mines": "Minen", "Vehicles": "Fahrzeuge"}
+
+
+def hd2_commands_de():
+    """the Helldivers 2 profile in German: German names + German phrases + the code names (TD-220 ...), same arrow codes"""
+    out = []
+    for n, cat, _, code in HD2:
+        name, phr, _ = hd2_de_entry(n)
+        out.append({"name": name, "category": GROUP_DE.get(cat, cat), "phrases": phr, "actions": [f"stratagem {code}"], "enabled": True})
+    for n, cat, _ in HD2_NO_CODE:
+        name, phr, _ = hd2_de_entry(n)
+        out.append({"name": name, "category": GROUP_DE.get(cat, cat), "phrases": phr, "enabled": False,
+                    "actions": ["# für diesen gibt es noch keinen Code - hier eintragen und AKTIV anhaken, z.B.", "# stratagem DLDUR"]})
+    return out
+
+
+def upgrade_hd2_de(p):
+    """German profile with my first German names -> the exact in-game names. Your own phrases, macros and on/off stay; returns {old: new} names, None if nothing to do"""
+    if APP_LANG != "de" or p.get("name") != HD2_NAME or p.get("de_names", 1) >= HD2_DE_NAMES: return None
+    ref = {}
+    for n in [h[0] for h in HD2] + [h[0] for h in HD2_NO_CODE]:
+        name, phr, old = hd2_de_entry(n); ref[old] = (name, phr); ref[name] = (name, phr)
+    moved = {}
+    for c in p.get("commands", []):
+        hit = ref.get(c.get("name"))
+        if not hit: continue                                                          # one of your own commands - untouched
+        name, phr = hit
+        if c["name"] != name: moved[c["name"]] = name
+        c["name"] = name; c["phrases"] = _dedup(phr + list(c.get("phrases", [])))    # exact name first, then everything you had
+    p["de_names"] = HD2_DE_NAMES
+    return moved
+
+
 def upgrade_hd2(p):
     """older Helldivers profile -> current list. Keeps your own commands, your taught phrases and any macro you changed."""
     v = p.get("version", 1)
-    if p.get("name") != "Helldivers 2" or v >= HD2_VERSION: return False
+    if APP_LANG == "de" or p.get("name") != "Helldivers 2" or v >= HD2_VERSION: return False      # German profile is never mixed with English
     new = hd2_commands(); names = {c["name"] for c in new}
     old = {c.get("name"): c for c in p.get("commands", [])}
     merged = []
@@ -714,8 +985,16 @@ def upgrade_hd2(p):
 
 
 def default_profiles():
-    hd = {"name": "Helldivers 2", "process": "helldivers2.exe", "version": HD2_VERSION, "stratagem": dict(STRAT_DEFAULT),
-          "commands": hd2_commands()}
+    hd = {"name": HD2_NAME, "process": "helldivers2.exe", "version": HD2_VERSION, "de_names": HD2_DE_NAMES, "stratagem": dict(STRAT_DEFAULT),
+          "commands": hd2_commands_de() if APP_LANG == "de" else hd2_commands()}
+    if APP_LANG == "de":
+        win = {"name": "Windows (Beispiel)", "process": "", "stratagem": dict(STRAT_DEFAULT), "commands": [
+            {"name": "Bildschirmfoto", "category": "Desktop", "phrases": ["bildschirmfoto", "screenshot"], "actions": ["press win+shift+s"], "enabled": True},
+            {"name": "Task-Manager", "category": "Desktop", "phrases": ["task manager", "aufgabenverwaltung"], "actions": ["press ctrl+shift+esc"], "enabled": True},
+            {"name": "Desktop anzeigen", "category": "Desktop", "phrases": ["desktop anzeigen"], "actions": ["press win+d"], "enabled": True},
+            {"name": "Gutes Spiel", "category": "Chat", "phrases": ["gutes spiel"], "actions": ["press enter", "wait 0.15", "type gg wp", "press enter"], "enabled": True},
+        ]}
+        return [hd, win]
     win = {"name": "Windows (example)", "process": "", "stratagem": dict(STRAT_DEFAULT), "commands": [
         {"name": "Screenshot", "category": "Desktop", "phrases": ["screenshot", "snip"], "actions": ["press win+shift+s"], "enabled": True},
         {"name": "Task Manager", "category": "Desktop", "phrases": ["task manager"], "actions": ["press ctrl+shift+esc"], "enabled": True},
@@ -790,6 +1069,24 @@ def _write_wav(path, x, sr=44100):
     with wave.open(path, "wb") as w: w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(data)
 
 
+TTS_PS = r"""
+[Console]::InputEncoding = [Text.Encoding]::UTF8
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Speech
+$s = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$v = @($s.GetInstalledVoices() | % { $_.VoiceInfo } | ? { $_.Culture.Name -like '@LANG@-*' })
+$m = @($v | ? { $_.Gender -eq 'Male' })
+if ($m.Count -gt 0) { $s.SelectVoice($m[0].Name) } elseif ($v.Count -gt 0) { $s.SelectVoice($v[0].Name) }
+$s.Rate = -1
+$fmt = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(22050, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono)
+while ($true) { $l = [Console]::In.ReadLine(); if ($l -eq $null) { break }
+  $p = $l.Split('|', 3)
+  try { $s.Rate = [int]$p[1]; $s.SetOutputToWaveFile($p[0], $fmt); $s.Speak($p[2]); $s.SetOutputToNull(); [Console]::Out.WriteLine("ok") }
+  catch { [Console]::Out.WriteLine("err") }
+  [Console]::Out.Flush() }
+""".replace("@LANG@", APP_LANG)
+
+
 def _read_wav(path):
     import wave
     with wave.open(path, "rb") as w:
@@ -799,11 +1096,26 @@ def _read_wav(path):
     return x, sr
 
 
-def robotize(x, sr):
+def robotize(x, sr, theme="skynet"):
     """plain Windows voice -> cold machine voice: lower + slower, ring-modulated, metallic comb, crushed, hard-clipped, echo"""
     x = np.asarray(x, np.float64)
     nz = np.flatnonzero(np.abs(x) > 0.01)                                 # trim silence
     if len(nz): x = x[max(0, nz[0] - 200): nz[-1] + 400]
+    if theme == "blackwatch":                                             # field radio: narrow band, compressed, static + squelch
+        x = np.interp(np.arange(0, len(x) - 1, 0.97), np.arange(len(x)), x)
+        y = np.diff(x, prepend=0) * 1.5; y = np.diff(y, prepend=0) * 0.5 + y          # cut the lows twice
+        y = np.convolve(y, np.ones(5) / 5, "same")                                    # cut the highs
+        y = np.tanh(y / (np.abs(y).max() + 1e-9) * 3.5) / np.tanh(3.5)                # radio compression
+        rng = np.random.default_rng(len(y)); y = y + rng.standard_normal(len(y)) * 0.025
+        sq = lambda d: np.diff(rng.standard_normal(int(sr * d)), prepend=0) * 0.25 * np.exp(-np.arange(int(sr * d)) / (sr * d * 0.4))
+        o = np.concatenate([sq(0.05), np.zeros(int(sr * 0.02)), y, np.zeros(int(sr * 0.03)), sq(0.12)])
+        return (o / (np.abs(o).max() + 1e-9) * 0.9).astype(np.float32)
+    if theme == "nano":                                                   # suit voice: calm, smooth, chorus + short room
+        x = np.interp(np.arange(0, len(x) - 1, 0.93), np.arange(len(x)), x); y = x.copy()
+        d = int(sr * 0.012); y[d:] += 0.45 * x[:-d]; d2 = int(sr * 0.021); y[d2:] += 0.25 * x[:-d2]
+        y = np.tanh(y * 1.4) / np.tanh(1.4); y = np.concatenate([y, np.zeros(int(sr * 0.25))]); o = y.copy()
+        d = int(sr * 0.06); o[d:] += 0.22 * y[:-d]
+        return (o / (np.abs(o).max() + 1e-9) * 0.9).astype(np.float32)
     k = 0.84                                                              # pitch + formants down
     x = np.interp(np.arange(0, len(x) - 1, k), np.arange(len(x)), x)
     t = np.arange(len(x)) / sr
@@ -903,16 +1215,144 @@ def _sfx(name, sr=44100):
         "on": lambda: dist(mix(servo(70, 260, 0.3, 0.18) * 0.6, at(0.26, hit(80, 0.3, 0.1)), at(0.26, clank(600, 0.03))), 2.5) * 0.3,
         "off": lambda: dist(mix(servo(260, 60, 0.35, 0.2) * 0.6, at(0.28, hit(70, 0.35, 0.12))), 2.5) * 0.3,
     }
+    if THEME == "nano": s = _nano_sounds(T, env, tone, glide, noise, sil, cat, mix, at, dist, sr)
+    elif THEME == "blackwatch": s = _radio_sounds(T, tone, glide, noise, sil, cat, mix, at, dist, sr)
+    if name in ("eye_open", "eye_close"): s = _eye_sounds(THEME, T, noise, fm, clank, servo, hit, tick, sil, cat, mix, at, dist, sr)
     f = s.get(name) or s["click"]
     x = f()
+    if THEME in ("nano", "blackwatch"):                    # even loudness
+        pk = float(np.abs(x).max()) or 1.0; x = x * min(1.0, 0.36 / pk)
     fade = min(len(x), int(sr * 0.006)); x[-fade:] *= np.linspace(1, 0, fade)   # no clicks at the end
     return np.clip(x, -1, 1).astype(np.float32)
 
 
+def _eye_sounds(theme, T, noise, fm, clank, servo, hit, tick, sil, cat, mix, at, dist, sr):
+    """the Skynet eye's 6 metal lids opening / closing - one clank per lid, a motor, and a lock at the end (original synthesis)"""
+    def lids(f, gap, r=0.02, rise=1.0):          # 6 staggered metal plates, each a bit higher / lower in pitch
+        return mix(*[at(i * gap, clank(f * rise ** i, r) * (0.55 + 0.08 * i)) for i in range(6)])
+    if theme == "nano":                          # suit tech: light servo, bright metal pings, air release
+        hiss = lambda d, v: noise(d, d * 0.5, 3) * np.sin(np.pi * T(d) / d) * v
+        return {
+            "eye_open": lambda: dist(mix(servo(260, 620, 0.32, 0.16) * 0.3, lids(1500, 0.035, 0.015, 1.07),
+                                         at(0.02, hiss(0.25, 0.25)), at(0.24, fm(2400, 2.41, 4, 0.25, 0.08) * 0.35)), 1.8) * 0.3,
+            "eye_close": lambda: dist(mix(servo(620, 240, 0.28, 0.14) * 0.3, lids(1900, 0.03, 0.015, 0.93),
+                                          at(0.2, fm(900, 1.41, 5, 0.2, 0.06) * 0.5), at(0.2, hiss(0.12, 0.2))), 1.8) * 0.3,
+        }
+    if theme == "blackwatch":                    # military hardware: hydraulic hiss, heavy steel bolts, armoured slam
+        hyd = lambda d, v: noise(d, d, 6) * np.minimum(1, T(d) / 0.02) * np.exp(-T(d) / (d * 0.6)) * v
+        return {
+            "eye_open": lambda: dist(mix(hyd(0.35, 0.45), at(0.04, servo(70, 150, 0.3, 0.18) * 0.45), at(0.06, lids(520, 0.04, 0.03, 1.04)),
+                                         at(0.3, hit(70, 0.3, 0.1) * 0.8), at(0.3, clank(380, 0.04))), 3) * 0.32,
+            "eye_close": lambda: dist(mix(hyd(0.25, 0.4), servo(150, 60, 0.26, 0.15) * 0.45, at(0.04, lids(600, 0.03, 0.03, 0.96)),
+                                          at(0.24, hit(60, 0.4, 0.14)), at(0.24, clank(300, 0.05) * 0.9)), 3) * 0.34,
+        }
+    return {                                     # skynet: cold machine - servo whine, 6 clanks, heavy lock
+        "eye_open": lambda: dist(mix(servo(90, 320, 0.34, 0.2) * 0.45, at(0.03, lids(700, 0.04, 0.022, 1.06)),
+                                     at(0.3, hit(95, 0.25, 0.08) * 0.7), at(0.3, fm(1100, 3.73, 6, 0.15, 0.05) * 0.4)), 2.5) * 0.32,
+        "eye_close": lambda: dist(mix(servo(320, 80, 0.3, 0.18) * 0.45, lids(900, 0.032, 0.022, 0.94),
+                                      at(0.22, hit(75, 0.35, 0.12)), at(0.22, clank(450, 0.04))), 2.5) * 0.34,
+    }
+
+
+def _radio_sounds(T, tone, glide, noise, sil, cat, mix, at, dist, sr):
+    """Blackwatch theme: military field-radio sounds - squelch clicks, static bursts, roger beeps, key-up chirps (original synthesis)"""
+    def band(x):                                      # telephone/radio band: cut lows (diff) and highs (short average), then clip
+        x = np.diff(x, prepend=0); x = np.convolve(x, np.ones(4) / 4, "same"); return np.tanh(x * 3) / np.tanh(3)
+    def squelch(d=0.06, v=1.0):                       # "kshh" - static burst with a hard start
+        t = T(d); return band(noise(d, 10, 1)) * np.minimum(1, t / 0.002) * np.exp(-t / (d * 0.5)) * v
+    def click(v=1.0): return band(noise(0.008, 0.002)) * v
+    def beep(f, d=0.05, v=1.0): return tone(f, d, d * 2, "sq") * 0.35 * v
+    def static(d=0.2, v=1.0): t = T(d); return band(noise(d, 10, 2)) * np.sin(np.pi * t / d) * 0.6 * v
+    def thud(f=90, d=0.1): return glide(f * 1.5, f, d, d * 0.35)
+    roger = lambda: cat(beep(1200, 0.06), beep(1600, 0.08))       # end-of-message beep
+    s = {
+        "click": lambda: click(0.8) * 0.4, "select": lambda: click(0.5) * 0.35, "chip": lambda: mix(click(), at(0.01, beep(1800, 0.02, 0.6))) * 0.35,
+        "key": lambda: mix(click(), thud(150, 0.04) * 0.4) * 0.4, "dir_U": lambda: mix(click(), thud(150, 0.04) * 0.4) * 0.4,
+        "dir_D": lambda: mix(click(), thud(150, 0.04) * 0.4) * 0.4, "dir_L": lambda: mix(click(), thud(150, 0.04) * 0.4) * 0.4,
+        "dir_R": lambda: mix(click(), thud(150, 0.04) * 0.4) * 0.4,
+        "open": lambda: mix(squelch(0.08, 0.6), at(0.05, static(0.12, 0.3))) * 0.5, "close": lambda: cat(static(0.08, 0.3), click()) * 0.5,
+        "gear": lambda: cat(click(), sil(0.03), click(), sil(0.03), click()) * 0.4, "gear_open": lambda: squelch(0.07, 0.5) * 0.5,
+        "edit": lambda: cat(click(), sil(0.02), beep(1400, 0.03)) * 0.4, "copy": lambda: cat(beep(1500, 0.03), sil(0.03), beep(1500, 0.03)) * 0.4,
+        "play": lambda: mix(squelch(0.1, 0.5), at(0.08, roger())) * 0.5, "save": lambda: mix(click(), at(0.02, roger()), thud(80, 0.12) * 0.3) * 0.5,
+        "cancel": lambda: cat(beep(900, 0.05), beep(600, 0.08)) * 0.4, "undo": lambda: cat(click(), beep(1000, 0.04)) * 0.4,
+        "trash": lambda: mix(static(0.25, 0.8), thud(60, 0.18) * 0.5) * 0.5,
+        "profile": lambda: mix(squelch(0.06, 0.5), at(0.05, beep(1300, 0.06))) * 0.5, "newprofile": lambda: cat(click(), roger()) * 0.45,
+        "plus": lambda: cat(click(), beep(1700, 0.04)) * 0.4, "import": lambda: mix(static(0.2, 0.6), at(0.15, beep(1100, 0.05))) * 0.5,
+        "folder": lambda: mix(thud(90, 0.1) * 0.5, click()) * 0.45, "stop": lambda: mix(squelch(0.12, 0.7), thud(70, 0.14) * 0.4) * 0.5,
+        "detect": lambda: cat(*[cat(beep(1800, 0.03), sil(0.09)) for _ in range(4)]) * 0.4,
+        "arrows": lambda: cat(*[cat(click(), sil(0.035)) for _ in range(4)]) * 0.4, "wasd": lambda: cat(*[cat(click(0.7), sil(0.035)) for _ in range(4)]) * 0.4,
+        "mic": lambda: mix(click(), at(0.01, squelch(0.04, 0.4))) * 0.45, "search": lambda: cat(beep(2000, 0.025), sil(0.03), beep(2000, 0.025)) * 0.4,
+        "rec": lambda: cat(beep(1600, 0.03), beep(2000, 0.04)) * 0.4, "wait": lambda: cat(click(), sil(0.08), click()) * 0.4,
+        # comms on / off
+        "locked": lambda: mix(squelch(0.15, 0.8), at(0.1, cat(beep(900, 0.06), beep(600, 0.1))), thud(60, 0.15) * 0.3) * 0.5,
+        "unlocked": lambda: mix(squelch(0.12, 0.7), at(0.1, cat(beep(800, 0.05), beep(1200, 0.05), beep(1600, 0.07)))) * 0.5,
+        "on": lambda: mix(static(0.35, 0.6), at(0.25, cat(beep(800, 0.06), beep(1200, 0.06), beep(1600, 0.1)))) * 0.5,
+        "off": lambda: mix(cat(beep(1600, 0.06), beep(1000, 0.06), beep(600, 0.1)), at(0.2, squelch(0.2, 0.7))) * 0.5,
+        # events
+        "ok": lambda: mix(click(), at(0.01, roger())) * 0.45,
+        "miss": lambda: mix(static(0.18, 0.7), at(0.04, beep(400, 0.1))) * 0.45,
+        "ptt_on": lambda: mix(squelch(0.05, 0.6), click()) * 0.45,                  # key up
+        "ptt_off": lambda: mix(click(), at(0.01, squelch(0.09, 0.8))) * 0.45,        # release: squelch tail
+        "denied": lambda: cat(beep(500, 0.08), sil(0.03), beep(500, 0.08)) * 0.45,
+    }
+    return s
+
+
+def _nano_sounds(T, env, tone, glide, noise, sil, cat, mix, at, dist, sr):
+    """Nano theme: clean suit-HUD sounds - crisp digital blips, pitch chirps, air whooshes, power-up swells (original synthesis)"""
+    def blip(f, d=0.03, v=1.0): return tone(f, d, d * 0.45) * v
+    def chirp(f0, f1, d, v=1.0): return glide(f0, f1, d, d * 0.7) * v
+    def shimmer(f, d=0.3, v=1.0): return mix(tone(f, d, d * 0.4), tone(f * 2.01, d, d * 0.3) * 0.45, tone(f * 3.03, d, d * 0.2) * 0.25) * v
+    def whoosh(d=0.16, v=1.0):
+        t = T(d)                                       # T here = the time axis helper of _sfx
+        n = noise(d, 10, 7); return n * np.sin(np.pi * t / d) ** 2 * v
+    def thump(f=70, d=0.12): return glide(f * 1.6, f, d, d * 0.4)
+    clk = lambda: mix(blip(3200, 0.016), noise(0.006, 0.0015) * 0.3)
+    s = {
+        "click": lambda: clk() * 0.32, "select": lambda: blip(4200, 0.012, 0.22),
+        "chip": lambda: cat(blip(2600, 0.02), blip(3400, 0.026)) * 0.26,
+        "key": lambda: blip(2900, 0.024, 0.28), "dir_U": lambda: blip(2900, 0.024, 0.28), "dir_D": lambda: blip(2900, 0.024, 0.28),
+        "dir_L": lambda: blip(2900, 0.024, 0.28), "dir_R": lambda: blip(2900, 0.024, 0.28),
+        "open": lambda: mix(whoosh(0.16, 0.5), at(0.04, chirp(900, 2000, 0.08, 0.35))) * 0.5,
+        "close": lambda: mix(whoosh(0.14, 0.5), chirp(2000, 800, 0.08, 0.35)) * 0.5,
+        "gear": lambda: cat(blip(3000, 0.02), sil(0.025), blip(3300, 0.02), sil(0.025), blip(3600, 0.025)) * 0.26,
+        "gear_open": lambda: mix(whoosh(0.12, 0.4), chirp(1200, 2400, 0.07, 0.3)) * 0.5,
+        "edit": lambda: chirp(1500, 2600, 0.06, 0.3), "copy": lambda: cat(blip(2800, 0.022), sil(0.03), blip(2800, 0.026)) * 0.27,
+        "play": lambda: mix(chirp(400, 2000, 0.15, 0.35), at(0.12, shimmer(2000, 0.18, 0.25))),
+        "save": lambda: mix(chirp(1200, 2600, 0.08, 0.32), at(0.07, shimmer(2600, 0.2, 0.2)), thump(80, 0.1) * 0.25),
+        "cancel": lambda: chirp(1600, 600, 0.1, 0.3), "undo": lambda: chirp(2000, 1100, 0.07, 0.28),
+        "trash": lambda: mix(whoosh(0.22, 0.6), thump(60, 0.18) * 0.4) * 0.5,
+        "profile": lambda: mix(shimmer(880, 0.25, 0.3), blip(3300, 0.02, 0.2)), "newprofile": lambda: cat(blip(2200, 0.03), shimmer(1100, 0.25)) * 0.28,
+        "plus": lambda: chirp(1200, 2400, 0.05, 0.3), "import": lambda: mix(whoosh(0.18, 0.5), chirp(2400, 900, 0.14, 0.3)) * 0.6,
+        "folder": lambda: mix(thump(90, 0.1) * 0.4, blip(2200, 0.03, 0.25)),
+        "stop": lambda: mix(chirp(1000, 300, 0.14, 0.32), thump(70, 0.14) * 0.3),
+        "detect": lambda: cat(*[cat(chirp(1500, 2600, 0.06, 0.25), sil(0.06)) for _ in range(3)]),
+        "arrows": lambda: cat(*[cat(blip(2700 + 150 * k, 0.018), sil(0.02)) for k in range(4)]) * 0.26,
+        "wasd": lambda: cat(*[cat(blip(2200 + 120 * k, 0.018), sil(0.02)) for k in range(4)]) * 0.26,
+        "mic": lambda: mix(blip(1800, 0.04, 0.28), noise(0.02, 0.005, 3) * 0.1),
+        "search": lambda: cat(blip(3800, 0.02), sil(0.025), blip(4300, 0.025)) * 0.24,
+        "rec": lambda: cat(blip(3000, 0.02), blip(3600, 0.03)) * 0.26, "wait": lambda: cat(blip(2000, 0.02), sil(0.08), blip(2000, 0.02)) * 0.26,
+        # armor-style power states
+        "locked": lambda: mix(thump(65, 0.2) * 0.45, chirp(1400, 400, 0.18, 0.3), at(0.12, shimmer(330, 0.3, 0.18))),
+        "unlocked": lambda: mix(chirp(300, 1500, 0.25, 0.3), at(0.2, shimmer(1500, 0.3, 0.22)), whoosh(0.25, 0.15)),
+        "on": lambda: mix(chirp(200, 1800, 0.45, 0.28), at(0.38, shimmer(1800, 0.35, 0.25)), whoosh(0.4, 0.15), thump(60, 0.2) * 0.3),
+        "off": lambda: mix(chirp(1800, 150, 0.45, 0.28), whoosh(0.35, 0.12), at(0.35, thump(55, 0.2) * 0.35)),
+        # events
+        "ok": lambda: cat(blip(2200, 0.035), blip(3300, 0.06)) * 0.3,
+        "miss": lambda: cat(tone(240, 0.07, 0.04, "tri"), sil(0.03), tone(200, 0.09, 0.05, "tri")) * 0.32,
+        "ptt_on": lambda: mix(blip(2400, 0.035, 0.3), noise(0.012, 0.003) * 0.2),
+        "ptt_off": lambda: mix(blip(1600, 0.04, 0.28), at(0.02, noise(0.05, 0.02, 4) * 0.1)),
+        "denied": lambda: cat(chirp(700, 300, 0.09, 0.3), sil(0.025), chirp(700, 300, 0.09, 0.3)),
+    }
+    return s
+
+
 SFX_NAMES = ["profile", "newprofile", "plus", "import", "folder", "trash", "gear", "stop", "edit", "copy", "play", "save", "cancel",
              "detect", "arrows", "wasd", "mic", "search", "locked", "unlocked", "rec", "undo", "wait", "click", "key", "chip", "select",
-             "dir_U", "dir_D", "dir_L", "dir_R", "open", "close", "ok", "miss", "ptt_on", "ptt_off", "denied", "on", "off"]
-SFX_VER = "v6_"
+             "dir_U", "dir_D", "dir_L", "dir_R", "open", "close", "ok", "miss", "ptt_on", "ptt_off", "denied", "on", "off",
+             "eye_open", "eye_close"]
+SFX_VER = {"nano": "n1_", "blackwatch": "b1_"}.get(THEME, "v6_")     # each theme keeps its own sound files
+SFX_KEEP = ("v6_", "n1_", "b1_")
 
 
 class Sfx:
@@ -921,7 +1361,7 @@ class Sfx:
         self.app, self.busy_until = app, 0.0
         try:                                               # sound files of older versions are not needed any more
             for f in os.listdir(SFX_DIR):
-                if f.endswith(".wav") and not f.startswith(SFX_VER): os.remove(os.path.join(SFX_DIR, f))
+                if f.endswith(".wav") and not f.startswith(SFX_KEEP): os.remove(os.path.join(SFX_DIR, f))
         except OSError: pass
         for nm in SFX_NAMES:
             p = os.path.join(SFX_DIR, f"{SFX_VER}{nm}.wav")
@@ -952,6 +1392,7 @@ class Sfx:
             import winsound
             winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
             if hold: self.busy_until = time.time() + hold
+            self.app.spk_mute_until = time.time() + _wav_len(path) + 0.25                # speaker listener must not hear the app itself
         except Exception: pass
 
 
@@ -964,20 +1405,25 @@ class Voice(threading.Thread):
         self.dir = os.path.join(SFX_DIR, "voice"); os.makedirs(self.dir, exist_ok=True)
         self.start()
 
-    def path(self, text):
+    def path(self, text, plain=None):
         import hashlib
-        return os.path.join(self.dir, "r1_" + hashlib.md5(text.lower().encode("utf-8")).hexdigest()[:16] + ".wav")
+        pre = f"p{plain}_" if plain is not None else {"nano": "n1_", "blackwatch": "b1_"}.get(THEME, "r1_")
+        return os.path.join(self.dir, pre + APP_LANG + hashlib.md5(text.lower().encode("utf-8")).hexdigest()[:16] + ".wav")
 
     def put(self, pri, item): self.n += 1; self.q.put((pri, self.n, item))
 
-    def say(self, text, delay=0.0): self.put(0, (text, time.time() + delay, True))      # spoken lines jump the queue
+    def say(self, text, delay=0.0): self.put(0, (text, time.time() + delay, True, None))      # spoken lines jump the queue
+
+    def pronounce(self, text, rate=-3):
+        """read a command aloud in a clear natural voice (no robot effect, slower) - to learn how to say it"""
+        self.put(0, (text, time.time(), True, rate))
 
     def warm(self, texts):
         for t in dict.fromkeys(texts):
-            if t and not os.path.exists(self.path(t)): self.put(1, (t, 0, False))
+            if t and not os.path.exists(self.path(t)): self.put(1, (t, 0, False, None))
 
-    def make(self, text):
-        p = self.path(text)
+    def make(self, text, plain=None):
+        p = self.path(text, plain)
         if os.path.exists(p): return p
         if self.proc is None or self.proc.poll() is not None:
             ps = os.path.join(SFX_DIR, "tts_wav.ps1")
@@ -985,18 +1431,21 @@ class Voice(threading.Thread):
             self.proc = subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps], stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", creationflags=0x08000000)
         raw = p[:-4] + "_raw.wav"
-        self.proc.stdin.write(raw + "|" + text.replace("\n", " ").replace("|", " ") + "\n"); self.proc.stdin.flush()
+        rate = plain if plain is not None else -1
+        self.proc.stdin.write(raw + "|" + str(int(rate)) + "|" + text.replace("\n", " ").replace("|", " ") + "\n"); self.proc.stdin.flush()
         if self.proc.stdout.readline().strip() != "ok": raise RuntimeError("speech engine failed")
-        x, sr = _read_wav(raw); _write_wav(p, robotize(x, sr), sr)
+        x, sr = _read_wav(raw)
+        if plain is not None: _write_wav(p, (x / (np.abs(x).max() + 1e-9) * 0.9).astype(np.float32), sr)    # natural voice, just evened out
+        else: _write_wav(p, robotize(x, sr, THEME), sr)
         try: os.remove(raw)
         except OSError: pass
         return p
 
     def run(self):
         while True:
-            text, when, play = self.q.get()[2]
+            text, when, play, plain = self.q.get()[2]
             try:
-                p = self.make(text)
+                p = self.make(text, plain)
                 if not play: continue
                 d = when - time.time()
                 if d > 0: time.sleep(d)
@@ -1089,13 +1538,39 @@ def list_mics():
     return out
 
 
+DEFAULT_SPK = "(Windows default speakers)"
+SPK_PRE = "LAUTSPRECHER ▸ " if APP_LANG == "de" else "SPEAKERS ▸ "                 # recording device list: listen to an output
+BOTH_PRE = "MIKRO + LAUTSPRECHER ▸ " if APP_LANG == "de" else "MIC + SPEAKERS ▸ "  # ... or to your mic AND an output
+ALL_SRC = "★ ALLE TONQUELLEN (alle Mikros + alle Lautsprecher)" if APP_LANG == "de" else "★ ALL SOUND SOURCES (every mic + every speaker)"
+
+
+def list_speakers():
+    """output devices you can listen to (WASAPI loopback = what plays on them: Discord, game, ...)"""
+    pa = get_pa(); out = []
+    with _PA_LOCK:
+        for d in pa.get_loopback_device_info_generator():
+            out.append({"index": d["index"], "name": d["name"].replace(" [Loopback]", "")})
+    return out
+
+
+def _wav_len(path, cache={}):
+    """seconds of a wav (cached) - the speaker listener stays deaf while the app's own sounds play"""
+    if path not in cache:
+        try:
+            import wave
+            with wave.open(path, "rb") as w: cache[path] = w.getnframes() / float(w.getframerate())
+        except Exception: cache[path] = 0.6
+    return cache[path]
+
+
 class Capture(threading.Thread):
     """Microphone -> 30 ms frames -> voice-activity detector (or push-to-talk) -> finished utterances."""
     FRAME = 480
+    SRC = "mic"
 
-    def __init__(self, app, mic_name):
+    def __init__(self, app, mic_name, extra=False):
         super().__init__(daemon=True)
-        self.app, self.mic_name, self.running, self.level, self.err = app, mic_name, True, 0.0, ""
+        self.app, self.mic_name, self.running, self.level, self.err, self.extra = app, mic_name, True, 0.0, "", extra
         self.pending = np.zeros(0, dtype=np.float32); self.reset(); self.noise = 0.003; self.ptt_rec = None
 
     def reset(self):
@@ -1106,7 +1581,7 @@ class Capture(threading.Thread):
         try:
             import pyaudiowpatch as pyaudio
             mics = list_mics()
-            dev = next((m for m in mics if m["name"] == self.mic_name), None) or (mics[0] if mics else None)
+            dev = next((m for m in mics if m["name"] == self.mic_name), None) or (None if self.extra else (mics[0] if mics else None))
             if not dev: self.err = "no microphone found"; self.app.log("no microphone found", "err"); return
             pa = get_pa()
             with _PA_LOCK:
@@ -1116,7 +1591,9 @@ class Capture(threading.Thread):
                              input_device_index=dev["index"], frames_per_buffer=int(self.rate * 0.03))
             self.app.log(f"microphone: {dev['name']}", "sys")
         except Exception as e:
-            self.err = str(e); self.app.log(f"microphone error: {e}", "err"); traceback.print_exc(); return
+            self.err = str(e)
+            if self.extra: self.app.log(f"skipped {self.mic_name}: {e}", "dim"); return      # ALL SOUND SOURCES: a busy device is just left out
+            self.app.log(f"microphone error: {e}", "err"); traceback.print_exc(); return
         while self.running:
             try: raw = st.read(int(self.rate * 0.03), exception_on_overflow=False)
             except Exception as e:
@@ -1147,7 +1624,7 @@ class Capture(threading.Thread):
             if sum(1 for f in frames if float(np.sqrt(np.mean(f * f))) > thr) < 5: return
         audio = np.concatenate(frames)
         if len(audio) < SR * 0.2: return
-        if self.app.utt_q.qsize() < 2: self.app.utt_q.put((time.time(), audio))
+        if self.app.utt_q.qsize() < 4: self.app.utt_q.put((time.time(), audio, self.SRC))
 
     def frame(self, f):
         cfg = self.app.cfg
@@ -1189,9 +1666,399 @@ class Capture(threading.Thread):
                 self.reset()
 
 
+class SpeakerCapture(Capture):
+    """SPEAKERS: listens to what your PC plays (friends on Discord / in-game voice chat) so they can call commands too.
+    Always voice detection (friends can't press your PTT key), stricter than the mic, deaf while the app's own sounds play,
+    and only voice-like sound goes to the speech AI (gunfire / music / explosions are thrown away first - no GPU used for them)."""
+    SRC = "spk"
+
+    def run(self):
+        thread_priority(2)
+        try:
+            import pyaudiowpatch as pyaudio
+            pa = get_pa()
+            with _PA_LOCK:
+                if self.mic_name:
+                    info = next((d for d in pa.get_loopback_device_info_generator() if d["name"].replace(" [Loopback]", "") == self.mic_name), None)
+                else: info = None
+                if info is None and self.extra: raise RuntimeError("not found")
+                info = info or pa.get_default_wasapi_loopback()
+                self.ch, self.rate = max(1, min(2, int(info["maxInputChannels"]))), int(info["defaultSampleRate"])
+                st = pa.open(format=pyaudio.paInt16, channels=self.ch, rate=self.rate, input=True,
+                             input_device_index=info["index"], frames_per_buffer=int(self.rate * 0.03))
+            self.app.log(f"speakers: listening to {info['name'].replace(' [Loopback]', '')} - friends can call commands", "sys")
+        except Exception as e:
+            self.err = str(e)
+            if self.extra: self.app.log(f"skipped {self.mic_name}: {e}", "dim"); return
+            self.app.log(f"speaker listening error: {e}", "err"); traceback.print_exc(); return
+        while self.running:
+            try: raw = st.read(int(self.rate * 0.03), exception_on_overflow=False)
+            except Exception as e:
+                self.app.log(f"speaker listening stopped: {e}", "err"); break
+            self.feed(self.to_16k(raw))
+        try:
+            with _PA_LOCK: st.stop_stream(); st.close()
+        except Exception: pass
+
+    @staticmethod
+    def voice_like(audio):
+        """most of the energy in the voice band (200-4000 Hz) and not flat noise -> a voice, not a gun / an explosion / static"""
+        a = audio[: SR * 6]; spec = np.abs(np.fft.rfft(a * np.hanning(len(a)))) ** 2
+        fr = np.fft.rfftfreq(len(a), 1 / SR); tot = float(spec[fr > 80].sum()) or 1e-12
+        band = float(spec[(fr >= 200) & (fr <= 4000)].sum()) / tot
+        sp = spec[(fr >= 300) & (fr <= 3400)] + 1e-12
+        flat = float(np.exp(np.mean(np.log(sp))) / np.mean(sp))          # 1 = white noise, small = tonal / voiced
+        return band > 0.5 and flat < 0.25
+
+    def emit(self, frames, need_voice=False):
+        audio = np.concatenate(frames)
+        if len(audio) < SR * 0.3 or not self.voice_like(audio): return
+        if self.app.utt_q.qsize() < 4: self.app.utt_q.put((time.time(), audio, self.SRC))
+
+    def frame(self, f):
+        cfg = self.app.cfg
+        rms = float(np.sqrt(np.mean(f * f))); self.level = max(rms, self.level * 0.85)
+        if not self.app.listening or time.time() < getattr(self.app, "spk_mute_until", 0.0):
+            self.reset(); return
+        thr = max(0.015, self.noise * 4.0)
+        if not self.in_speech:
+            self.preroll.append(f)
+            self.hot = self.hot + 1 if rms > thr else 0
+            self.noise = self.noise * 0.9 + rms * 0.1 if rms < self.noise else self.noise * 0.995 + rms * 0.005
+            if self.hot >= 3:
+                self.in_speech, self.rec, self.voiced, self.silent = True, list(self.preroll), self.hot, 0
+        else:
+            self.rec.append(f)
+            if rms > thr * 0.75: self.voiced += 1; self.silent = 0
+            else: self.silent += 1
+            if self.silent * 30 >= int(cfg.get("silence_ms", 380)) or len(self.rec) * 0.03 > 4:
+                if self.voiced >= 8: self.emit(self.rec[:len(self.rec) - max(0, self.silent - 8)])
+                self.reset()
+
+
 # ======================================================================  UI
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, font as tkfont
+
+# ======================================================================  German interface (COMMAND LANGUAGE: deutsch)
+# every text the app shows goes through tr(): exact lines from DE, dynamic messages through DE_RULES. English mode: tr() does nothing.
+DE = {
+    # ---- header / status
+    "LIVE": "LIVE", "PTT": "PTT", "TALK": "SPRICH", "LOCKED": "GESPERRT", "LOADING": "LÄDT", "OFFLINE": "OFFLINE", "AI OFF": "KI AUS",
+    "IN GAME": "IM SPIEL", "WAITING": "WARTET", "ANY": "ALLE", "MADE BY SALUTEM": "VON SALUTEM", "MIC:": "MIKRO:",
+    "Always listening": "Hört immer zu", "just say a command": "sag einfach einen Befehl", "Transmitting - speak now": "Sendet - jetzt sprechen",
+    "Push-to-talk ready": "Push-to-Talk bereit", "Listening is LOCKED": "Zuhören ist GESPERRT", "the lock button": "die Sperrtaste",
+    "Speech AI is OFFLINE - uses no RAM / graphics memory": "Sprach-KI ist OFFLINE - belegt keinen RAM / Grafikspeicher",
+    "click to bring it online": "klicken, um sie zu starten", "Speech AI is coming online…": "Sprach-KI startet…",
+    "Speech AI could not start - see the log": "Sprach-KI konnte nicht starten - siehe Protokoll", "click to switch it off": "klicken zum Ausschalten",
+    "click: speech AI OFFLINE (frees RAM / graphics memory)": "klicken: Sprach-KI OFFLINE (gibt RAM / Grafikspeicher frei)",
+    "graphics card (GPU)": "Grafikkarte (GPU)", "processor (CPU)": "Prozessor (CPU)",
+    "⚙ OPTIONS → GPU BOOST makes it faster + more accurate": "⚙ OPTIONEN → GPU-BOOST macht sie schneller + genauer",
+    "green < 400 ms · orange < 900 ms": "grün < 400 ms · orange < 900 ms",
+    "in front - commands fire": "im Vordergrund - Befehle werden ausgelöst", "not in front - commands wait": "nicht im Vordergrund - Befehle warten",
+    "No game set - commands work in any program": "Kein Spiel gesetzt - Befehle wirken in jedem Programm", "(✎ PROFILE → GAME .EXE)": "(✎ PROFIL → SPIEL .EXE)",
+    "Skynet eye: auto-detect game ON": "Skynet-Auge: Spielerkennung AN", "Skynet eye: auto-detect game OFF": "Skynet-Auge: Spielerkennung AUS",
+    "the eye is open and watching for your game - click to close it": "das Auge ist offen und sucht dein Spiel - klicken zum Schließen",
+    "the eye is shut - click to open it and detect games": "das Auge ist zu - klicken zum Öffnen und Spiele erkennen",
+    # ---- credit card
+    "◢ SALUTEM": "◢ SALUTEM", "STEAM": "STEAM", "DISCORD": "DISCORD", "click to open": "klicken zum Öffnen", "click to copy": "klicken zum Kopieren",
+    "opened ✔": "geöffnet ✔", "copied ✔": "kopiert ✔", "⚠ THIS APP IS FREE - IT CANNOT BE SOLD": "⚠ DIESE APP IST KOSTENLOS - SIE DARF NICHT VERKAUFT WERDEN",
+    "if you paid for it, you were scammed": "wenn du dafür bezahlt hast, wurdest du betrogen",
+    "license: PolyForm Noncommercial 1.0.0  (LICENSE.txt)": "Lizenz: PolyForm Noncommercial 1.0.0  (LICENSE.txt)",
+    # ---- buttons (title / description)
+    "Save": "Speichern", "keep the changes": "Änderungen behalten", "Test": "Testen", "presses the keys after 3 seconds -": "drückt die Tasten nach 3 Sekunden -",
+    "switch to the game or Notepad": "wechsle zum Spiel oder zum Editor", "Cancel": "Abbrechen", "close without saving": "schließen ohne zu speichern",
+    "Detect game": "Spiel erkennen", "click, then switch to the game within 5 seconds": "klicken, dann innerhalb von 5 Sekunden zum Spiel wechseln",
+    "Arrow keys": "Pfeiltasten", "stratagem directions = ↑ ↓ ← →": "Strategem-Richtungen = ↑ ↓ ← →", "WASD": "WASD",
+    "stratagem directions = W A S D": "Strategem-Richtungen = W A S D", "Profile": "Profil", "name, game .exe and stratagem keys of this profile": "Name, Spiel-.exe und Strategem-Tasten dieses Profils",
+    "New profile": "Neues Profil", "start an empty profile for another game": "leeres Profil für ein anderes Spiel anlegen", "Import": "Importieren",
+    "VoiceAttack .vap (XML) or a Skynet .json profile": "VoiceAttack .vap (XML) oder ein Skynet-.json-Profil", "Profiles folder": "Profilordner",
+    "open the folder with the profile files": "den Ordner mit den Profildateien öffnen", "Delete profile": "Profil löschen",
+    "moves the file to profiles\\deleted": "verschiebt die Datei nach profiles\\deleted", "Stop macro": "Makro stoppen",
+    "abort the macro that is running right now": "das gerade laufende Makro abbrechen", "Options": "Optionen",
+    "recording device, push-to-talk, lock key,": "Aufnahmegerät, Push-to-Talk, Sperrtaste,", "macro speed, speech AI": "Makro-Tempo, Sprach-KI",
+    "Add command": "Befehl hinzufügen", "new voice command for this profile": "neuer Sprachbefehl für dieses Profil", "Edit command": "Befehl bearbeiten",
+    "change the selected command (or double-click it)": "den gewählten Befehl ändern (oder doppelklicken)", "Duplicate": "Duplizieren",
+    "copy the selected command": "den gewählten Befehl kopieren", "Test command": "Befehl testen", "presses its keys after 3 seconds": "drückt seine Tasten nach 3 Sekunden",
+    "Delete command": "Befehl löschen", "remove the selected command": "den gewählten Befehl entfernen", "Listening is ON": "Zuhören ist AN",
+    "click to LOCK - nothing you say will fire": "klicken zum SPERREN - nichts Gesagtes wird ausgelöst", "click to UNLOCK - commands go live": "klicken zum ENTSPERREN - Befehle werden aktiv",
+    "Close": "Schließen", "Esc": "Esc", "Clear": "Leeren", "no key": "keine Taste", "— none —": "— keine —", "press a key…": "Taste drücken…",
+    "Resize": "Größe ändern", "drag to make the command list or the log wider": "ziehen, um Befehlsliste oder Protokoll breiter zu machen",
+    "double-click = reset": "Doppelklick = zurücksetzen",
+    "Refresh - drop waiting commands": "Aktualisieren - wartende Befehle verwerfen", "forgets everything you said that has not fired yet": "vergisst alles Gesagte, das noch nicht ausgelöst wurde",
+    "and stops a macro that is running -": "und stoppt ein laufendes Makro -", "nothing old will be pushed into the game": "nichts Altes wird ins Spiel gedrückt",
+    # ---- main window
+    "COMMAND": "BEFEHL", "WHEN I SAY": "WENN ICH SAGE", "DO THIS": "MACHE DAS", "GROUP": "GRUPPE", "COMMAND LOG": "BEFEHLSPROTOKOLL",
+    "click ▸ lines to edit": "▸ Zeilen anklicken zum Bearbeiten", "Search": "Suche", "type to filter the commands by name, phrase or group": "tippen, um Befehle nach Name, Satz oder Gruppe zu filtern",
+    "Commands": "Befehle", "click = select · double-click / Enter = edit · Delete = remove": "Klick = wählen · Doppelklick / Enter = bearbeiten · Entf = entfernen",
+    "scroll with the wheel or the bar on the right": "mit dem Mausrad oder der Leiste rechts scrollen", "Command log": "Befehlsprotokoll",
+    "what was heard and what fired": "was gehört und was ausgelöst wurde", "click a line with ▸ to edit that command,": "eine Zeile mit ▸ anklicken, um den Befehl zu bearbeiten,",
+    "or to turn something unrecognised into a new command": "oder Unerkanntes zu einem neuen Befehl zu machen",
+    "which game's commands are active": "welche Spielbefehle aktiv sind", "(switches by itself when you open a game)": "(wechselt von selbst, wenn du ein Spiel öffnest)",
+    "Name, game .exe, stratagem keys (arrows / WASD)": "Name, Spiel-.exe, Strategem-Tasten (Pfeile / WASD)", "New empty profile": "Neues leeres Profil",
+    "Import a VoiceAttack .vap (XML) or a Skynet .json profile": "Ein VoiceAttack-.vap (XML) oder Skynet-.json-Profil importieren",
+    "Delete this profile": "Dieses Profil löschen", "Open the profiles folder": "Den Profilordner öffnen", "Lock / unlock listening (hotkey in ⚙ OPTIONS)": "Zuhören sperren / entsperren (Hotkey in ⚙ OPTIONEN)",
+    "Abort the macro that is running": "Das laufende Makro abbrechen", "Recording device, push-to-talk, lock key, macro speed, speech AI": "Aufnahmegerät, Push-to-Talk, Sperrtaste, Makro-Tempo, Sprach-KI",
+    "Recording device": "Aufnahmegerät", "the bar in the header shows its level": "die Leiste oben zeigt den Pegel",
+    "Which microphone Skynet Command listens to (the bar in the header shows its level)": "Welches Mikrofon Skynet Command abhört (die Leiste oben zeigt den Pegel)",
+    "how fast every macro presses its keys - click to change": "wie schnell jedes Makro seine Tasten drückt - klicken zum Ändern",
+    "works anywhere, also in game - click to change": "wirkt überall, auch im Spiel - klicken zum Ändern", "click to change": "klicken zum Ändern",
+    "SAY ANY OF THESE": "SAG EINS DAVON", "DOES": "MACHT", "double-click to edit": "Doppelklick zum Bearbeiten", "— not set —": "— nicht gesetzt —",
+    "(Windows default microphone)": "(Windows-Standardmikrofon)",
+    # ---- combo / ranks
+    "COMBO": "KOMBO", "TOTAL": "GESAMT", "MAX RANK": "MAX. RANG", "◢ RANKS": "◢ RÄNGE", "◀ YOU": "◀ DU", "MAX RANK - you made it": "MAX. RANG - geschafft",
+    "Combo & rank": "Kombo & Rang", "COMBO = successful commands in a row (a miss or 2 minutes without a command breaks it)":
+        "KOMBO = erfolgreiche Befehle in Folge (ein Fehlschlag oder 2 Minuten ohne Befehl beendet sie)",
+    "TOTAL = every successful command ever · BEST = your longest combo": "GESAMT = alle erfolgreichen Befehle · BESTE = deine längste Kombo",
+    "50 ranks - every successful command is 1 XP": "50 Ränge - jeder erfolgreiche Befehl ist 1 EP", "click your rank to see every rank": "klicke deinen Rang, um alle Ränge zu sehen",
+    # ---- dialogs (titles, frame)
+    "◢ OPTIONS": "◢ OPTIONEN", "◢ EDIT COMMAND": "◢ BEFEHL BEARBEITEN", "◢ NEW COMMAND": "◢ NEUER BEFEHL", "◢ PROFILE": "◢ PROFIL",
+    "SKYNET COMMAND  //  CONFIG": "SKYNET COMMAND  //  KONFIG", "SKYNET COMMAND  //  EDITOR": "SKYNET COMMAND  //  EDITOR",
+    "LISTENING": "ZUHÖREN", "SPEECH AI": "SPRACH-KI", "LOOK": "AUSSEHEN", "MACROS": "MAKROS", "SOUND": "TON", "PERFORMANCE  ·  GAME FPS": "LEISTUNG  ·  SPIEL-FPS",
+    "STRATAGEM KEYS  ·  CLICK, THEN PRESS": "STRATEGEM-TASTEN  ·  KLICKEN, DANN DRÜCKEN", "SPEED  ·  ⚙ OPTIONS → MACRO SPEED": "TEMPO  ·  ⚙ OPTIONEN → MAKRO-TEMPO",
+    # ---- command editor
+    "NAME": "NAME", "shown in the list and the log": "wird in der Liste und im Protokoll gezeigt", "click a group - or type your own": "Gruppe anklicken - oder eigene eintippen",
+    "Own group": "Eigene Gruppe", "type any name": "beliebigen Namen tippen", "one phrase": "ein Satz", "per line": "pro Zeile",
+    "BUILD THE": "MAKRO", "MACRO": "BAUEN", "click the arrows (or press your arrow keys / WASD while": "Pfeile anklicken (oder Pfeiltasten / WASD drücken, während",
+    "no text box is selected) - each one is added to a stratagem.": "kein Textfeld gewählt ist) - jeder wird zum Strategem hinzugefügt.",
+    "+ KEY: click it, then press any key or combo on your keyboard.": "+ TASTE: anklicken, dann eine Taste oder Kombination drücken.",
+    "Stratagem code": "Strategem-Code", "the arrows of the stratagem in this macro": "die Pfeile des Strategems in diesem Makro", "＋ KEY": "＋ TASTE",
+    "＋ Key press": "＋ Tastendruck", "click, then press a key or combo (ctrl+shift+s, mouse4...)": "klicken, dann Taste oder Kombination drücken (ctrl+shift+s, mouse4...)",
+    "it is added as 'press ...'": "sie wird als 'press ...' hinzugefügt", "＋ Wait": "＋ Warten", "adds 'wait 0.1' (change the number below)": "fügt 'wait 0.1' hinzu (Zahl unten ändern)",
+    "＋ Mouse click": "＋ Mausklick", "adds 'click left'": "fügt 'click left' hinzu", "Undo": "Rückgängig", "removes the last arrow / line": "entfernt den letzten Pfeil / die letzte Zeile",
+    "Clear macro": "Makro leeren", "empties the whole macro": "leert das ganze Makro", "click to switch off": "klicken zum Ausschalten", "click to switch on": "klicken zum Einschalten",
+    "press ↑ ↓ ← → or W A S D (while no text box is selected)": "↑ ↓ ← → oder W A S D drücken (während kein Textfeld gewählt ist)",
+    "built above -": "oben gebaut -", "or type here": "oder hier tippen", "Macro (advanced)": "Makro (fortgeschritten)", "ENABLED": "AKTIV",
+    "off = the command is kept but never fires": "aus = der Befehl bleibt, wird aber nie ausgelöst",
+    "keyboard capture off": "Tastatur-Erfassung aus", "○ click an empty spot here to use your keys": "○ hier auf eine freie Stelle klicken, um deine Tasten zu benutzen",
+    "● LIVE: press ↑ ↓ ← → / W A S D": "● LIVE: ↑ ↓ ← → / W A S D drücken", "click the arrows ←": "die Pfeile anklicken ←",
+    "add at least one phrase under WHEN I SAY": "mindestens einen Satz unter WENN ICH SAGE eintragen", "the macro is empty - click the arrows or + KEY": "das Makro ist leer - Pfeile oder + TASTE anklicken",
+    "one action per line   (key speed for every macro: ⚙ OPTIONS → MACRO SPEED)": "eine Aktion pro Zeile   (Tastentempo für jedes Makro: ⚙ OPTIONEN → MAKRO-TEMPO)",
+    # ---- profile dialog
+    "the profile name, e.g. the game's name": "der Profilname, z.B. der Name des Spiels", "GAME .EXE": "SPIEL .EXE",
+    "pick the game from the programs running now": "das Spiel aus den laufenden Programmen wählen", "(no alt-tabbing) or type the .exe name.": "(kein Alt-Tab nötig) oder den .exe-Namen tippen.",
+    "empty = commands work in any program": "leer = Befehle wirken in jedem Programm", "AUTO-DETECT GAME": "SPIEL AUTOMATISCH ERKENNEN",
+    "while GAME .EXE is empty: the first time you say a": "solange SPIEL .EXE leer ist: wenn du zum ersten Mal", "command inside a full-screen program, that program": "in einem Vollbildprogramm einen Befehl sagst, wird dieses Programm",
+    "becomes this profile's game - automatically": "automatisch das Spiel dieses Profils", "(same switch as the Skynet eye: open = on)": "(gleicher Schalter wie das Skynet-Auge: offen = an)",
+    "(Windows default speakers)": "(Windows-Standardlautsprecher)",
+    "what Skynet Command listens to (also in the main window)": "worauf Skynet Command hört (auch im Hauptfenster)",
+    "SPEAKERS ▸ = what your PC plays: friends in Discord /": "LAUTSPRECHER ▸ = was dein PC abspielt: Freunde in Discord /",
+    "game voice chat can say commands (always on for them,": "im Spiel-Sprachchat können Befehle sagen (für sie immer an,",
+    "only voice-like sound reaches the speech AI)": "nur stimmenähnlicher Ton erreicht die Sprach-KI)",
+    "MIC + SPEAKERS ▸ = you AND your friends": "MIKRO + LAUTSPRECHER ▸ = du UND deine Freunde",
+    "★ ALL SOUND SOURCES = every microphone and every output at once": "★ ALLE TONQUELLEN = jedes Mikrofon und jede Ausgabe gleichzeitig",
+    "MENU KEY": "MENÜTASTE", "Helldivers 2 default: left ctrl": "Helldivers 2 Standard: linke Strg", "MENU MODE": "MENÜMODUS",
+    "hold = keep menu key down": "halten = Menütaste gedrückt halten", "tap = game option 'toggle'": "tippen = Spieloption 'umschalten'",
+    "UP": "OBEN", "DOWN": "UNTEN", "LEFT": "LINKS", "RIGHT": "RECHTS", "click the box, then press it": "Feld anklicken, dann drücken",
+    "could not detect - pick it from the list": "nicht erkannt - aus der Liste wählen", "set the menu key and all four direction keys": "Menütaste und alle vier Richtungstasten setzen",
+    "give the profile a name": "gib dem Profil einen Namen",
+    # ---- options
+    "RECORDING DEVICE": "AUFNAHMEGERÄT", "the microphone Skynet Command listens to": "das Mikrofon, das Skynet Command abhört", "(also in the main window)": "(auch im Hauptfenster)",
+    "LISTEN MODE": "HÖRMODUS", "always = voice detection": "immer = Spracherkennung", "ptt = only while the key is held": "ptt = nur solange die Taste gehalten wird",
+    "PUSH-TO-TALK KEY": "PUSH-TO-TALK-TASTE", "mouse buttons work too": "Maustasten gehen auch", "LOCK / UNLOCK": "ZUHÖREN SPERREN /", "LISTENING KEY": "ENTSPERREN-TASTE",
+    "press it anywhere (also in game)": "überall drücken (auch im Spiel)", "to stop / start listening": "um das Zuhören zu stoppen / starten",
+    "MIC SENSITIVITY": "MIKRO-EMPFINDLICHKEIT", "higher = reacts to quieter speech": "höher = reagiert auf leiseres Sprechen", "END OF PHRASE (ms)": "SATZENDE (ms)",
+    "silence that ends a command": "Stille, die einen Befehl beendet", "lower = faster, higher = longer phrases": "niedriger = schneller, höher = längere Sätze",
+    "WHISPER MODEL": "WHISPER-MODELL", "auto = large-v3-turbo on NVIDIA GPU, distil-small.en on CPU": "auto = large-v3-turbo auf NVIDIA-GPU, distil-small.en auf der CPU",
+    ".en models are English-only and faster": ".en-Modelle sind nur Englisch und schneller",
+    "memory (GPU saver / normal):  large-v3-turbo ~0.9 / 1.6 GB · distil-small.en ~0.25 / 0.4 GB": "Speicher (GPU sparen / normal):  large-v3-turbo ~0,9 / 1,6 GB · distil-small.en ~0,25 / 0,4 GB",
+    "small.en ~0.3 / 0.5 GB · base.en ~0.1 / 0.15 GB  - smaller = lighter on the game": "small.en ~0,3 / 0,5 GB · base.en ~0,1 / 0,15 GB  - kleiner = schont das Spiel",
+    "RUN ON": "LÄUFT AUF", "auto = NVIDIA GPU if its libraries are installed, else CPU": "auto = NVIDIA-GPU wenn ihre Bibliotheken installiert sind, sonst CPU",
+    "LANGUAGE": "SPRACHE", "the language Whisper listens for": "die Sprache, auf die Whisper hört", "not English = a multilingual model is used": "nicht Englisch = ein mehrsprachiges Modell wird benutzt",
+    "(COMMAND LANGUAGE: deutsch always listens in German)": "(BEFEHLSSPRACHE: deutsch hört immer auf Deutsch)", "GPU BOOST": "GPU-BOOST",
+    "NVIDIA cards: installs the CUDA libraries (~1 GB, one time)": "NVIDIA-Karten: installiert die CUDA-Bibliotheken (~1 GB, einmalig)",
+    "so the big accurate model runs on the graphics card -": "damit das große genaue Modell auf der Grafikkarte läuft -",
+    "better recognition AND faster. Restart the app afterwards.": "bessere Erkennung UND schneller. Danach die App neu starten.",
+    "Install GPU boost": "GPU-Boost installieren", "opens the installer window (about 1 GB download)": "öffnet das Installationsfenster (ca. 1 GB Download)",
+    "installed ✔": "installiert ✔", "NVIDIA card found - not installed": "NVIDIA-Karte gefunden - nicht installiert", "not installed": "nicht installiert",
+    "MATCH STRICTNESS": "ERKENNUNGS-STRENGE", "lower = forgives more mishearing": "niedriger = verzeiht mehr Verhörer", "higher = fewer wrong triggers": "höher = weniger Fehlauslöser",
+    "TEACH WHISPER": "WHISPER MEINE", "MY COMMANDS": "BEFEHLE LEHREN", "gives Whisper the command words as a hint": "gibt Whisper die Befehlswörter als Hinweis",
+    "WINDOW ON TOP": "FENSTER IM VORDERGRUND", "keep Skynet Command above other windows": "Skynet Command über anderen Fenstern halten",
+    "THEME": "DESIGN", "SKYNET THEME = red machine HUD, TV static, Terminator-style sounds": "SKYNET-DESIGN = rotes Maschinen-HUD, TV-Rauschen, Terminator-artige Klänge",
+    "NANO THEME = pale-mint suit HUD, hex armour cells, nanosuit-style sounds and voice": "NANO-DESIGN = mintgrünes Anzug-HUD, Hex-Panzerzellen, Nanoanzug-artige Klänge und Stimme",
+    "BLACKWATCH THEME = black + military yellow, tactical grid, radio-comms sounds and voice, military ranks": "BLACKWATCH-DESIGN = schwarz + Militärgelb, taktisches Gitter, Funk-Klänge und -Stimme, Militärränge",
+    "the app restarts by itself to switch": "die App startet zum Wechseln von selbst neu",
+    "the language you SAY your commands in": "die Sprache, in der du deine Befehle SAGST",
+    "DEUTSCH = its own German profiles (Helldivers 2 in German),": "DEUTSCH = eigene deutsche Profile (Helldivers 2 auf Deutsch),",
+    "German speech AI and German voice - your English profiles stay separate and untouched": "deutsche Sprach-KI und deutsche Stimme - deine englischen Profile bleiben getrennt und unberührt",
+    "MACRO SPEED": "MAKRO-TEMPO", "(ms per key)": "(ms pro Taste)", "time for each key press in EVERY macro": "Zeit für jeden Tastendruck in JEDEM Makro",
+    "15 = very fast · 60 = safe · 80+ = slow PCs": "15 = sehr schnell · 60 = sicher · 80+ = langsame PCs", "if the game misses keys, raise it": "wenn das Spiel Tasten verpasst, erhöhen",
+    "ONLY WHEN GAME": "NUR WENN SPIEL", "IS IN FRONT": "IM VORDERGRUND", "uses the profile's GAME .EXE": "nutzt die SPIEL .EXE des Profils",
+    "pick the profile of the game you open, and learn the game": "wählt das Profil des geöffneten Spiels und lernt das Spiel", "of a profile that has none (same as clicking the Skynet eye)": "eines Profils ohne Spiel (wie ein Klick aufs Skynet-Auge)",
+    "VOLUME": "LAUTSTÄRKE", "all sounds and the voice of this app": "alle Klänge und die Stimme dieser App", "(your game and Windows are not touched)": "(dein Spiel und Windows bleiben unberührt)",
+    "BUTTON SOUNDS": "TASTENKLÄNGE", "every button has its own sound": "jede Taste hat ihren eigenen Klang", "COMMAND SOUND": "BEFEHLSKLANG", "a chime when a command fires": "ein Ton, wenn ein Befehl ausgelöst wird",
+    "FAIL SOUND": "FEHLERKLANG", "a buzz when nothing matched or the game was not in front": "ein Brummen, wenn nichts passte oder das Spiel nicht im Vordergrund war",
+    "ptt only = only with push-to-talk (talking to friends": "nur ptt = nur mit Push-to-Talk (mit Freunden reden", "in 'always' mode would buzz a lot)": "würde im Modus 'immer' oft brummen)",
+    "PUSH-TO-TALK SOUNDS": "PUSH-TO-TALK-KLÄNGE", "radio click when you press / release the PTT key,": "Funkklick beim Drücken / Loslassen der PTT-Taste,", "lock / unlock sounds": "Sperr- / Entsperrklänge",
+    "SKYNET VOICE": "SKYNET-STIMME", "SUIT VOICE": "ANZUG-STIMME", "RADIO VOICE": "FUNK-STIMME",
+    "a cold machine voice says the command name when it fires": "eine kalte Maschinenstimme sagt den Befehlsnamen, wenn er ausgelöst wird",
+    "('Hellbomb') and 'listening online / offline'": "('Höllenbombe') und 'Zuhören aktiv / gesperrt'", "SPOKEN REPLIES": "GESPROCHENE ANTWORTEN",
+    "lets 'say ...' actions talk (Skynet voice)": "lässt 'say ...'-Aktionen sprechen (Skynet-Stimme)",
+    "AI LOAD": "KI-LAST", "how hard the speech AI works on every command": "wie stark die Sprach-KI bei jedem Befehl arbeitet",
+    "low = lightest on your GPU / CPU (one quick pass)": "niedrig = am leichtesten für GPU / CPU (ein schneller Durchgang)",
+    "balanced = good accuracy, short bursts": "ausgewogen = gute Genauigkeit, kurze Spitzen", "max = most accurate, heaviest (second careful pass)": "max = am genauesten, am schwersten (zweiter genauer Durchgang)",
+    "GPU MEMORY": "GPU-SPEICHER", "saver = the model is stored smaller on the graphics card": "sparen = das Modell liegt kleiner auf der Grafikkarte",
+    "(about half the VRAM, same accuracy for commands)": "(etwa halber VRAM, gleiche Genauigkeit für Befehle)", "normal = full size": "normal = volle Größe",
+    "CPU THREADS": "CPU-THREADS", "fewer = more left for the game (CPU mode is slower then)": "weniger = mehr übrig fürs Spiel (CPU-Modus ist dann langsamer)",
+    "GAME FIRST": "SPIEL ZUERST", "runs this app at low priority:": "lässt diese App mit niedriger Priorität laufen:", "Windows always serves the game first": "Windows bedient immer zuerst das Spiel",
+    "PAUSE ANIMATIONS": "ANIMATIONEN PAUSIEREN", "while another program is in front, all animations stop": "solange ein anderes Programm im Vordergrund ist, stoppen alle Animationen",
+    "(the window uses almost nothing for drawing)": "(das Fenster braucht fast nichts zum Zeichnen)", "DROP LATE": "SPÄTE BEFEHLE", "COMMANDS (s)": "VERWERFEN (s)",
+    "a command that could not fire within this many seconds": "ein Befehl, der nicht innerhalb so vieler Sekunden ausgelöst werden konnte,",
+    "of you saying it is thrown away instead of pushed late": "nachdem du ihn gesagt hast, wird verworfen statt zu spät gedrückt",
+    "NOW USING": "AKTUELL BELEGT", "memory this app uses right now": "Speicher, den diese App gerade belegt", "RAM = system memory · VRAM = graphics card memory": "RAM = Arbeitsspeicher · VRAM = Grafikkartenspeicher",
+    "biggest saving: a smaller WHISPER MODEL or RUN ON: cpu (frees the GPU completely)": "größte Ersparnis: ein kleineres WHISPER-MODELL oder LÄUFT AUF: cpu (gibt die GPU ganz frei)",
+    "Install GPU boost.bat is missing": "Install GPU boost.bat fehlt", "set a push-to-talk key first": "zuerst eine Push-to-Talk-Taste setzen",
+    # Segmented choices (shown upper case)
+    "ALWAYS": "IMMER", "LOW": "NIEDRIG", "BALANCED": "AUSGEWOGEN", "MAX": "MAX", "SAVER": "SPAREN", "NORMAL": "NORMAL", "OFF": "AUS", "PTT ONLY": "NUR PTT",
+    "HOLD": "HALTEN", "TAP": "TIPPEN", "AUTO": "AUTO", "GPU": "GPU", "CPU": "CPU", "ENGLISH": "ENGLISCH", "DEUTSCH": "DEUTSCH",
+    "SKYNET": "SKYNET", "NANO": "NANO", "BLACKWATCH": "BLACKWATCH",
+    # ---- log + messages
+    "SKYNET COMMAND online. loading the speech model...": "SKYNET COMMAND online. Sprachmodell wird geladen...",
+    "made by Salutem · this app is FREE and cannot be sold": "von Salutem · diese App ist KOSTENLOS und darf nicht verkauft werden",
+    "a profile with that name exists": "ein Profil mit diesem Namen gibt es schon", "keep at least one profile": "mindestens ein Profil behalten",
+    "(the file goes to profiles/deleted)": "(die Datei kommt nach profiles/deleted)", "Could not import:": "Import fehlgeschlagen:",
+    "Import VoiceAttack profile (.vap) or Skynet profile (.json)": "VoiceAttack-Profil (.vap) oder Skynet-Profil (.json) importieren", "All files": "Alle Dateien", "Profiles": "Profile",
+    "NVIDIA card found, but its speed-up libraries are missing: ⚙ OPTIONS → GPU BOOST (one click, ~1 GB) makes recognition much more accurate AND faster (large-v3-turbo on the GPU). Using the CPU for now.":
+        "NVIDIA-Karte gefunden, aber ihre Beschleunigungs-Bibliotheken fehlen: ⚙ OPTIONEN → GPU-BOOST (ein Klick, ~1 GB) macht die Erkennung viel genauer UND schneller (large-v3-turbo auf der GPU). Vorerst wird die CPU benutzt.",
+    "speech AI OFFLINE - its RAM / graphics memory is free": "Sprach-KI OFFLINE - ihr RAM / Grafikspeicher ist frei", "⚡ speech AI coming ONLINE…": "⚡ Sprach-KI startet…",
+    "auto-detect game OFF - profiles stay as you pick them": "Spielerkennung AUS - Profile bleiben, wie du sie wählst", "auto-detect game ON - profiles follow the game you open": "Spielerkennung AN - Profile folgen dem geöffneten Spiel",
+    "listening LOCKED - nothing you say will fire": "Zuhören GESPERRT - nichts Gesagtes wird ausgelöst", "listening UNLOCKED - commands are live": "Zuhören ENTSPERRT - Befehle sind aktiv",
+    "settings saved": "Einstellungen gespeichert", "settings saved - reloading speech model": "Einstellungen gespeichert - Sprachmodell wird neu geladen",
+    "restarting to switch theme / language…": "Neustart zum Wechsel von Design / Sprache…", "no microphone found": "kein Mikrofon gefunden", "speech engine failed": "Sprach-Engine fehlgeschlagen",
+    "which key?": "welche Taste?", "use: hold <key> <seconds>": "so: hold <Taste> <Sekunden>", "code uses U D L R (or arrows ↑ ↓ ← →)": "Code benutzt U D L R (oder Pfeile ↑ ↓ ← →)",
+    # ---- key names
+    "CTRL": "STRG", "LEFT CTRL": "STRG LINKS", "RIGHT CTRL": "STRG RECHTS", "SHIFT": "UMSCHALT", "LEFT SHIFT": "UMSCHALT LINKS", "RIGHT SHIFT": "UMSCHALT RECHTS",
+    "LEFT ALT": "ALT LINKS", "RIGHT WINDOWS": "WINDOWS RECHTS", "← LEFT": "← LINKS", "↑ UP": "↑ OBEN", "→ RIGHT": "→ RECHTS", "↓ DOWN": "↓ UNTEN",
+    "LEFT MOUSE": "LINKE MAUSTASTE", "RIGHT MOUSE": "RECHTE MAUSTASTE", "MIDDLE MOUSE": "MITTLERE MAUSTASTE", "MOUSE 4 (BACK)": "MAUS 4 (ZURÜCK)", "MOUSE 5 (FORWARD)": "MAUS 5 (VOR)",
+    "BACKSPACE": "RÜCKTASTE", "CAPS LOCK": "FESTSTELLTASTE", "ENTER": "EINGABE", "SPACE": "LEERTASTE", "PAGE DOWN": "BILD AB", "PAGE UP": "BILD AUF",
+    "PRINT SCREEN": "DRUCK", "SCROLL LOCK": "ROLLEN", "DELETE": "ENTF", "END": "ENDE", "HOME": "POS1", "INSERT": "EINFG",
+    "Hear it": "Anhören", "reads the selected command aloud - its name and how to say it": "liest den gewählten Befehl vor - seinen Namen und wie man ihn sagt",
+    "(or click the speaker on any row)": "(oder den Lautsprecher in einer Zeile anklicken)", "PRONUNCIATION": "AUSSPRACHE-", "SPEED": "TEMPO",
+    "how fast ♪ reads a command aloud (speaker on each row / HEAR button)": "wie schnell ♪ einen Befehl vorliest (Lautsprecher in jeder Zeile / ANHÖREN-Taste)",
+    "slow = easier to follow when learning the words": "langsam = leichter nachzusprechen beim Lernen der Wörter", "SLOW": "LANGSAM",
+    "no German Windows voice installed - it is read with an English voice. Install one: Windows Settings → Time & language → Speech → Manage voices → Add voices → Deutsch, then restart the app.":
+        "keine deutsche Windows-Stimme installiert - es wird mit einer englischen Stimme vorgelesen. Installieren: Windows-Einstellungen → Zeit und Sprache → Spracherkennung → Stimmen verwalten → Stimmen hinzufügen → Deutsch, dann die App neu starten.",
+    "LCTRL": "LSTRG", "RCTRL": "RSTRG", "LSHIFT": "LUMSCH", "RSHIFT": "RUMSCH", "CAPS": "FEST", "LMB": "LMT", "RMB": "RMT",
+}
+_de_tr = lambda m: tr(m.group(0))
+DE_RULES = [
+    (r"^“(.+?)” → (.+?)   (\d+)% · (\d+) ms to fire \(AI (\d+) ms(?:, waited (\d+) ms)?\) \+ keys (\d+) ms(.*)$",
+     lambda m: f"“{m[1]}” → {m[2]}   {m[3]}% · {m[4]} ms bis zum Auslösen (KI {m[5]} ms" + (f", gewartet {m[6]} ms" if m[6] else "") + f") + Tasten {m[7]} ms"
+     + m[8].replace("  (2nd pass: ", "  (2. Durchgang: ").replace("  · via speakers", "  · über Lautsprecher")),
+    (r"^“(.+?)” → no match(.*)$", lambda m: f"“{m[1]}” → kein Treffer" + tr(m[2]) if m[2] else f"“{m[1]}” → kein Treffer"),
+    (r"^\(closest: (.+) (\d+)%\)  · click to teach it$", lambda m: f"(am ähnlichsten: {m[1]} {m[2]}%)  · klicken zum Beibringen"),
+    (r"^· click to make it a command$", lambda m: "· klicken, um daraus einen Befehl zu machen"),
+    (r"^“(.+?)” → (.+?) — ignored, (.+) is not in front$", lambda m: f"“{m[1]}” → {m[2]} — ignoriert, {m[3]} ist nicht im Vordergrund"),
+    (r"^“(.+?)” → (.+?) — dropped, said (.+) s ago$", lambda m: f"“{m[1]}” → {m[2]} — verworfen, vor {m[3]} s gesagt"),
+    (r"^“(.+?)”  ▸  no match$", lambda m: f"“{m[1]}”  ▸  kein Treffer"),
+    (r"^“(.+?)”  ▸  (.+?) \(GAME NOT IN FRONT\)  (\d+)%$", lambda m: f"“{m[1]}”  ▸  {m[2]} (SPIEL NICHT IM VORDERGRUND)  {m[3]}%"),
+    (r"^dropped a command said (.+) s ago \(too late\)$", lambda m: f"Befehl verworfen, vor {m[1]} s gesagt (zu spät)"),
+    (r"^(speech|macro|voice|microphone) error: (.*)$", lambda m: {"speech": "Spracherkennungsfehler", "macro": "Makro-Fehler", "voice": "Stimmenfehler", "microphone": "Mikrofonfehler"}[m[1]] + ": " + m[2]),
+    (r"^speakers: listening to (.*) - friends can call commands$", lambda m: f"Lautsprecher: höre {m[1]} zu - Freunde können Befehle geben"),
+    (r"^speaker listening (error|stopped): (.*)$", lambda m: ("Lautsprecher-Fehler: " if m[1] == "error" else "Lautsprecher gestoppt: ") + m[2]),
+    (r"^skipped (.*?): (.*)$", lambda m: f"übersprungen {m[1]}: {m[2]}"),
+    (r"^◂ speakers: “(.+?)” → no match(.*)$", lambda m: f"◂ Lautsprecher: “{m[1]}” → kein Treffer" + m[2].replace(" (closest: ", " (am ähnlichsten: ")),
+    (r"^◂ speakers: “(.+?)” → (.+?) — skipped, you just used it \(game call-out\?\)$", lambda m: f"◂ Lautsprecher: “{m[1]}” → {m[2]} — übersprungen, du hast es gerade benutzt (Spiel-Ansage?)"),
+    (r"^microphone: (.*)$", lambda m: f"Mikrofon: {m[1]}"), (r"^microphone stopped: (.*)$", lambda m: f"Mikrofon gestoppt: {m[1]}"),
+    (r"^x(\d+) COMBO!$", lambda m: f"x{m[1]} KOMBO!"), (r"^COMBO x(\d+) LOST$", lambda m: f"KOMBO x{m[1]} VERLOREN"),
+    (r"^RANK UP · (.+)$", lambda m: f"RANGAUFSTIEG · {m[1]}"), (r"^▲ RANK UP - level (\d+): (.+)$", lambda m: f"▲ RANGAUFSTIEG - Stufe {m[1]}: {m[2]}"),
+    (r"^BEST x(\d+)$", lambda m: f"BESTE x{m[1]}"), (r"^(\d+)/(\d+) XP$", lambda m: f"{m[1]}/{m[2]} EP"), (r"^LV (\d+)$", lambda m: f"ST {m[1]}"),
+    (r"^LV (\d+) · (\d+) XP$", lambda m: f"ST {m[1]} · {m[2]} EP"), (r"^(\d+) XP$", lambda m: f"{m[1]} EP"),
+    (r"^next rank in (\d+) successful commands?$", lambda m: f"nächster Rang in {m[1]} erfolgreichen Befehl" + ("en" if m[1] != "1" else "")),
+    (r"^Keyboard capture is (ON|OFF)$", lambda m: "Tastatur-Erfassung ist " + ("AN" if m[1] == "ON" else "AUS")),
+    (r"^the key the game uses for stratagem (.+)$", lambda m: f"die Taste, die das Spiel für Strategem {tr(m[1])} benutzt"),
+    (r"^detected: (.+)$", lambda m: f"erkannt: {m[1]}"), (r"^switch to the game\.\.\. (\d+)$", lambda m: f"wechsle zum Spiel... {m[1]}"),
+    (r"^how many of your (\d+) CPU threads the speech AI may use$", lambda m: f"wie viele deiner {m[1]} CPU-Threads die Sprach-KI nutzen darf"),
+    (r"^Helldivers 2 profile upgraded \((\d+) commands\).*$", lambda m: f"Helldivers-2-Profil aktualisiert ({m[1]} Befehle): jedes Strategem hört jetzt auch auf seinen vollen Namen und Codenamen - deine eigenen Sätze und Änderungen blieben erhalten"),
+    (r"^lock / unlock listening anytime with (.+)$", lambda m: f"Zuhören jederzeit sperren / entsperren mit {m[1]}"),
+    (r"^could not save profile: (.*)$", lambda m: f"Profil konnte nicht gespeichert werden: {m[1]}"),
+    (r"^profile '(.+)' · (\d+) commands(?: · (.+))?$", lambda m: f"Profil '{m[1]}' · {m[2]} Befehle" + (f" · {tr(m[3])}" if m[3] else "")),
+    (r"^Delete profile '(.+)'\?$", lambda m: f"Profil '{m[1]}' löschen?"), (r"^Delete command '(.+)'\?$", lambda m: f"Befehl '{m[1]}' löschen?"),
+    (r"^imported '(.+)': (\d+) commands(?: · (\d+) unsupported actions kept as # comments)?$",
+     lambda m: f"'{m[1]}' importiert: {m[2]} Befehle" + (f" · {m[3]} nicht unterstützte Aktionen als # Kommentare behalten" if m[3] else "")),
+    (r"^(\d+) commands$", lambda m: f"{m[1]} Befehle"), (r"^added '(.+)'$", lambda m: f"'{m[1]}' hinzugefügt"),
+    (r"^TEST '(.+)' in (\d+) s - switch to the game / Notepad now$", lambda m: f"TEST '{m[1]}' in {m[2]} s - jetzt zum Spiel / Editor wechseln"),
+    (r"^TEST '(.+)' - keys sent$", lambda m: f"TEST '{m[1]}' - Tasten gesendet"),
+    (r"^loading Whisper '(.+)' on (\w+) \(first time downloads it\)\.\.\.$", lambda m: f"lade Whisper '{m[1]}' auf {m[2]} (beim ersten Mal wird es heruntergeladen)..."),
+    (r"^speech ready: (.+) on (\w+)\. say a command!$", lambda m: f"Sprache bereit: {m[1]} auf {m[2]}. Sag einen Befehl!"),
+    (r"^could not load the speech model: (.*)$", lambda m: f"Sprachmodell konnte nicht geladen werden: {m[1]}"), (r"^(\w+) failed: (.*)$", lambda m: f"{m[1]} fehlgeschlagen: {m[2]}"),
+    (r"^game detected automatically: (.+) → saved in profile '(.+)'$", lambda m: f"Spiel automatisch erkannt: {m[1]} → im Profil '{m[2]}' gespeichert"),
+    (r"^⟳ refreshed - (\d+) waiting commands? dropped, nothing old will fire$", lambda m: f"⟳ aktualisiert - {m[1]} wartende Befehle verworfen, nichts Altes wird ausgelöst"),
+    (r"^(\S+) detected$", lambda m: f"{m[1]} erkannt"),
+    (r"^Macro speed: (\d+) ms per key$", lambda m: f"Makro-Tempo: {m[1]} ms pro Taste"), (r"^Lock / unlock listening: (.+)$", lambda m: f"Zuhören sperren / entsperren: {tr(m[1])}"),
+    (r"^Push-to-talk: hold (.+) while you speak$", lambda m: f"Push-to-Talk: {tr(m[1])} halten, während du sprichst"),
+    (r"^press (.+) to unlock$", lambda m: f"{tr(m[1])} drücken zum Entsperren"), (r"^hold (.+) and speak$", lambda m: f"{tr(m[1])} halten und sprechen"),
+    (r"^Speech AI: (.+) on the (.+)$", lambda m: f"Sprach-KI: {m[1]} auf der {tr(m[2])}"),
+    (r"^Last command took (\d+) ms from the end of your words to the keys$", lambda m: f"Letzter Befehl: {m[1]} ms vom Ende deiner Worte bis zu den Tasten"),
+    (r"^Game: (.+)$", lambda m: f"Spiel: {m[1]}"), (r"^'(.+)' is not in this profile any more$", lambda m: f"'{m[1]}' ist nicht mehr in diesem Profil"),
+    (r"^taught: “(.+)” now means (.+)$", lambda m: f"beigebracht: “{m[1]}” bedeutet jetzt {m[2]}"),
+    (r"^“(.+)” was added to (.+)'s phrases - press SAVE to keep it$", lambda m: f"“{m[1]}” wurde zu den Sätzen von {m[2]} hinzugefügt - SPEICHERN drücken, um es zu behalten"),
+    (r"^restart failed: (.*) - please start the app again$", lambda m: f"Neustart fehlgeschlagen: {m[1]} - bitte die App neu starten"),
+    (r"^unknown key '(.+)'$", lambda m: f"unbekannte Taste '{m[1]}'"), (r"^line (\d+): (.*)$", lambda m: f"Zeile {m[1]}: {tr(m[2])}"),
+    (r"^unknown action '(.+)'$", lambda m: f"unbekannte Aktion '{m[1]}'"), (r"^'(.+)': (.*)$", lambda m: f"'{m[1]}': " + "; ".join(tr(x) for x in m[2].split("; "))),
+    (r"^◢ (.+)$", lambda m: "◢ " + tr(m[1])), (r"^▸ (.+)$", lambda m: "▸ " + tr(m[1])), (r"^── (.+) ──$", lambda m: f"── {tr(m[1])} ──"),
+    (r"^(.+) \+ (.+)$", lambda m: " + ".join(tr(x) for x in m[0].split(" + "))),                         # key combos 'LEFT CTRL + S'
+    (r"^NUMPAD (.+)$", lambda m: f"NUMPAD {m[1]}"),
+]
+_DE_RULES = [(re.compile(p), f) for p, f in DE_RULES]
+_TR_CACHE = {}
+
+
+def tr(s):
+    """translate a text for the German interface (unchanged in English mode, and for anything not in the table)"""
+    if APP_LANG != "de" or not isinstance(s, str) or not s.strip(): return s
+    r = _TR_CACHE.get(s)
+    if r is not None: return r
+    if s in DE: r = DE[s]
+    elif "\n" in s: r = "\n".join(tr(x) for x in s.split("\n"))
+    else:
+        core = s.strip(); lead = s[:len(s) - len(s.lstrip())]; trail = s[len(s.rstrip()):]
+        r = s
+        if core in DE: r = lead + DE[core] + trail
+        else:
+            for rx, f in _DE_RULES:
+                m = rx.match(core)
+                if m:
+                    try: r = lead + f(m) + trail
+                    except Exception: r = s
+                    break
+    if len(_TR_CACHE) < 20000: _TR_CACHE[s] = r
+    return r
+
+
+def _install_tr():
+    """German mode: route every text the app shows through tr() - labels, canvas text, tooltips, titles, message boxes"""
+    if APP_LANG != "de": return
+    ct, ic = getattr(tk.Canvas, "create_text"), getattr(tk.Canvas, "itemconfigure")
+    def create_text(self, *a, **kw):
+        if "text" in kw: kw["text"] = tr(kw["text"])
+        return ct(self, *a, **kw)
+    def itemconfigure(self, tagOrId, cnf=None, **kw):
+        if "text" in kw: kw["text"] = tr(kw["text"])
+        return ic(self, tagOrId, cnf, **kw)
+    tk.Canvas.create_text, tk.Canvas.itemconfigure, tk.Canvas.itemconfig = create_text, itemconfigure, itemconfigure
+    for cls in (tk.Label, tk.Button, tk.Checkbutton):
+        init, conf = cls.__init__, getattr(cls, "configure", None)
+        if conf is None: continue
+        def __init__(self, master=None, cnf={}, _init=init, **kw):
+            if "text" in kw: kw["text"] = tr(kw["text"])
+            _init(self, master, cnf, **kw)
+        def configure(self, cnf=None, _conf=conf, **kw):
+            if "text" in kw: kw["text"] = tr(kw["text"])
+            return _conf(self, cnf, **kw)
+        cls.__init__, cls.configure, cls.config = __init__, configure, configure
+    if hasattr(tk, "Wm") and hasattr(tk.Wm, "wm_title"):
+        wt_ = tk.Wm.wm_title
+        tk.Wm.wm_title = tk.Wm.title = lambda self, string=None: wt_(self, tr(string) if string else string)
+    for name in ("showerror", "showinfo", "showwarning", "askyesno", "askokcancel"):
+        f = getattr(messagebox, name)
+        setattr(messagebox, name, (lambda f: lambda title=None, message=None, **kw: f(tr(title), tr(message), **kw))(f))
+    fd = filedialog.askopenfilename
+    filedialog.askopenfilename = lambda **kw: fd(**{**kw, "title": tr(kw.get("title")),
+                                                     "filetypes": [(tr(a), b) for a, b in kw.get("filetypes", [])] or kw.get("filetypes", ())})
+
+
+_install_tr()
 
 
 # ---------------- readable key names ----------------
@@ -1215,7 +2082,7 @@ SHORT_KEY = {"lctrl": "LCTRL", "rctrl": "RCTRL", "ctrl": "CTRL", "lshift": "LSHI
 
 def pretty_key(k):
     k = k.strip().lower()
-    if k in PRETTY: return PRETTY[k]
+    if k in PRETTY: return tr(PRETTY[k]) if "tr" in globals() else PRETTY[k]
     m = re.fullmatch(r"num(\d)", k)
     return f"NUMPAD {m.group(1)}" if m else k.upper()
 
@@ -1230,7 +2097,8 @@ def pretty_action(a):
     if v == "stratagem": return "★ " + " ".join(ARROW_GLYPH.get(ARROWS.get(ch.upper() if ch.isalpha() else ch, ""), ch) for ch in rest if not ch.isspace())
     if v in ("press", "tap", "key", "down", "up", "hold"):
         parts = rest.split()
-        return f"{v.upper()} {pretty_combo(parts[0]) if parts else ''}" + (f" {parts[1]}" if len(parts) > 1 else "")
+        vb = {"press": "DRÜCKE", "tap": "TIPPE", "key": "TASTE", "down": "RUNTER", "up": "HOCH", "hold": "HALTE"}.get(v, v.upper()) if APP_LANG == "de" else v.upper()
+        return f"{vb} {pretty_combo(parts[0]) if parts else ''}" + (f" {parts[1]}" if len(parts) > 1 else "")
     return a
 
 
@@ -1427,14 +2295,15 @@ class Tip:
     def show(self):
         self.job = None
         if not self.text: return
+        text = tr(self.text)
         try:
             tw = self.tw = tk.Toplevel(self.w); tw.overrideredirect(True); tw.attributes("-topmost", True)
             try: tw.attributes("-alpha", 0.0)
             except Exception: pass
-            box = tk.Frame(tw, bg="#101218", highlightthickness=1, highlightbackground=RED); box.pack()
-            title, _, body = self.text.partition("\n")
-            tk.Label(box, text="◢ " + title.upper(), bg="#101218", fg=ORANGE, font=(MONO, 9, "bold"), justify="left", anchor="w", padx=9).pack(fill="x", pady=(5, 0 if body else 5))
-            if body: tk.Label(box, text=body, bg="#101218", fg=WHITE, font=(MONO, 9), justify="left", anchor="w", padx=9, wraplength=420).pack(fill="x", pady=(1, 6))
+            box = tk.Frame(tw, bg=T("#101218"), highlightthickness=1, highlightbackground=RED); box.pack()
+            title, _, body = text.partition("\n")
+            tk.Label(box, text="◢ " + title.upper(), bg=T("#101218"), fg=ORANGE, font=(MONO, 9, "bold"), justify="left", anchor="w", padx=9).pack(fill="x", pady=(5, 0 if body else 5))
+            if body: tk.Label(box, text=body, bg=T("#101218"), fg=WHITE, font=(MONO, 9), justify="left", anchor="w", padx=9, wraplength=420).pack(fill="x", pady=(1, 6))
             tw.update_idletasks()
             x = min(self.w.winfo_rootx(), self.w.winfo_screenwidth() - tw.winfo_reqwidth() - 8)
             y = self.w.winfo_rooty() + self.w.winfo_height() + 6
@@ -1499,7 +2368,7 @@ class IconButton(tk.Canvas):
         h, f = self.h, self.flash; x0, y0, x1, y1, cut = 3, 2, W - 4, H - 3, 7
         breathe = 0.5 + 0.5 * math.sin(t * 2.2)
         edge = lerp(lerp(self.bgc, self.fg, 0.35 + 0.15 * breathe), self.fg, h)
-        fill = lerp(lerp(self.bgc, "#2A0C0C" if self.fg != ORANGE else "#2A1606", h), self.fg, f * 0.7)
+        fill = lerp(lerp(self.bgc, T("#2A0C0C") if self.fg != ORANGE else T("#2A1606"), h), self.fg, f * 0.7)
         self.create_polygon(x0, y0, x1 - cut, y0, x1, y0 + cut, x1, y1, x0 + cut, y1, x0, y1 - cut, fill=fill, outline=edge)
         if h > 0.05:   # sweep line + lock-on brackets
             sx = x0 + ((t * 120) % max(1, x1 - x0)); self.create_line(sx, y0 + 1, sx, y1 - 1, fill=lerp(fill, self.fg, 0.3 * h))
@@ -1524,7 +2393,7 @@ class StatusChip(tk.Canvas):
         self.bind("<Button-1>", lambda e: (sfx("gear"), cmd()), add="+"); self.refresh(); self.after(40, self.tick)
     def refresh(self):
         self.value = self.value_fn() or "—"
-        w = 34 + sum(self.f.measure(v) + 12 for v in self.value.split("+")) + 4 * self.value.count("+")
+        w = 34 + sum(self.f.measure(tr(v)) + 12 for v in self.value.split("+")) + 4 * self.value.count("+")
         self.config(width=max(44, w))
     def tick(self):
         try:
@@ -1534,14 +2403,14 @@ class StatusChip(tk.Canvas):
         except tk.TclError: pass
     def draw(self):
         self.delete("all"); W, H = self.winfo_width(), self.winfo_height(); t = time.time() - self.t0; h = self.h
-        self.create_polygon(1, 1, W - 7, 1, W - 1, 7, W - 1, H - 2, 7, H - 2, 1, H - 8, fill=lerp(self.bgc, "#2A0C0C", h * 0.8),
+        self.create_polygon(1, 1, W - 7, 1, W - 1, 7, W - 1, H - 2, 7, H - 2, 1, H - 8, fill=lerp(self.bgc, T("#2A0C0C"), h * 0.8),
                             outline=lerp(lerp(self.bgc, self.fg, 0.4 + 0.15 * math.sin(t * 2)), ORANGE, h))
         draw_icon(self, self.icon, 6, 7, 20, lerp(self.fg, WHITE, 0.2 * h), t)
         x = 32
         for k, v in enumerate(self.value.split("+")):           # each key as a key cap
             if k: self.create_text(x - 1, H / 2, text="+", fill=DIM, font=self.f); x += 4
-            vw = self.f.measure(v) + 8
-            self.create_rectangle(x, 8, x + vw, H - 9, fill="#16181E", outline=lerp(RED_DIM, ORANGE, h))
+            vw = self.f.measure(tr(v)) + 8
+            self.create_rectangle(x, 8, x + vw, H - 9, fill=T("#16181E"), outline=lerp(RED_DIM, ORANGE, h))
             self.create_line(x + 1, H - 9, x + vw - 1, H - 9, fill=lerp(RED_DIM, RED, 0.5 + 0.5 * math.sin(t * 3 + k)), width=2)
             self.create_text(x + vw / 2, H / 2 - 1, text=v, fill=WHITE, font=self.f); x += vw + 4
 
@@ -1578,6 +2447,7 @@ BTN = {   # label -> (icon, name, what it does)
     "✎ EDIT": ("edit", "Edit command", "change the selected command (or double-click it)"),
     "⧉ COPY": ("copy", "Duplicate", "copy the selected command"),
     "▶ TEST": ("play", "Test command", "presses its keys after 3 seconds"),
+    "♪ HEAR": ("listen", "Hear it", "reads the selected command aloud - its name and how to say it\n(or click the speaker on any row)"),
     "✖ DELETE": ("trash", "Delete command", "remove the selected command"),
     "■ LOCK LISTENING": ("unlocked", "Listening is ON", "click to LOCK - nothing you say will fire"),
     "▶ UNLOCK LISTENING": ("locked", "Listening is LOCKED", "click to UNLOCK - commands go live"),
@@ -1610,9 +2480,50 @@ def _png_b64(rgb):
 _STATIC_CACHE = {}
 
 
+def _hex_tile(R=8, W=192, H=112):
+    """(edge strength, cell id) of a seamless hex grid tile - pure numpy, no Pillow"""
+    y, x = np.mgrid[0:H, 0:W].astype(np.float32); best = np.full((H, W), 1e9, np.float32); second = best.copy()
+    cid = np.zeros((H, W), np.int32); px, py = 3 * R, 14.0                     # lattice A (0,0) + lattice B (12,7) = hex cells
+    for ox, oy, base in ((0.0, 0.0, 0), (px / 2, py / 2, 100000)):
+        ci = np.round((x - ox) / px); cj = np.round((y - oy) / py)
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                cx, cy = (ci + di) * px + ox, (cj + dj) * py + oy
+                d = np.hypot(x - cx, (y - cy) * 1.0)
+                ids = base + ((ci + di) % (W // px)).astype(np.int32) * 1000 + ((cj + dj) % (H // py)).astype(np.int32)
+                closer = d < best
+                second = np.where(closer, best, np.minimum(second, d)); cid = np.where(closer, ids, cid); best = np.minimum(best, d)
+    edge = np.clip(1.0 - (second - best) / 1.6, 0, 1)                     # 1 on the cell borders
+    return edge, cid
+
+
 def static_frames(bg, amount):
-    """8 tiles of dark red-tinted TV static (made once, shared by every background)"""
-    key = (bg, amount)
+    """8 background tiles, made once and shared by every background.
+    skynet: dark red-tinted TV static · nano: faint hex armour cells, a few cells glow in each frame"""
+    key = (bg, amount, THEME)
+    if key not in _STATIC_CACHE and THEME == "blackwatch":     # tactical grid: faint yellow lines, small + marks, one target cell per frame
+        rng = np.random.default_rng(5); base = np.array([int(bg[i:i + 2], 16) for i in (1, 3, 5)], np.float32)
+        TH, TW, G = 112, 192, 32; y, x = np.mgrid[0:TH, 0:TW]; tint = np.array([1.0, 0.78, 0.18], np.float32); out = []
+        grid = ((x % G == 0) | (y % G == 0)).astype(np.float32) * 0.35
+        grid += (((x % G == G // 2) & (abs(y % G - G // 2) <= 2)) | ((y % G == G // 2) & (abs(x % G - G // 2) <= 2))) * 0.5
+        for _ in range(8):
+            lum = grid * amount + rng.random((TH, TW), dtype=np.float32) ** 3 * amount * 0.18
+            cx, cy = rng.integers(0, TW // G) * G, rng.integers(0, TH // G) * G     # one cell lit like a target box
+            box = ((x >= cx) & (x <= cx + G) & (y >= cy) & (y <= cy + G)); edge = box & ((x == cx) | (x == cx + G) | (y == cy) | (y == cy + G))
+            lum[box] += amount * 0.08; lum[edge] += amount * 0.6
+            rgb = base + np.clip(lum, 0, 255)[..., None] * tint
+            out.append(tk.PhotoImage(data=_png_b64(np.clip(rgb, 0, 255).astype(np.uint8))).zoom(2, 2))
+        _STATIC_CACHE[key] = out
+    if key not in _STATIC_CACHE and THEME == "nano":
+        rng = np.random.default_rng(11); base = np.array([int(bg[i:i + 2], 16) for i in (1, 3, 5)], np.float32)
+        edge, cid = _hex_tile(); cells = np.unique(cid); tint = np.array([0.55, 1.0, 0.78], np.float32); out = []
+        for _ in range(8):
+            lum = edge * amount * 0.55 + rng.random(edge.shape, dtype=np.float32) ** 3 * amount * 0.12
+            for c in rng.choice(cells, 3, replace=False):                     # a few glowing cells per frame
+                m = cid == c; lum[m] += amount * rng.uniform(0.12, 0.3); lum[m & (edge > 0.3)] += amount * 0.5
+            rgb = base + np.clip(lum, 0, 255)[..., None] * tint
+            out.append(tk.PhotoImage(data=_png_b64(np.clip(rgb, 0, 255).astype(np.uint8))).zoom(2, 2))
+        _STATIC_CACHE[key] = out
     if key not in _STATIC_CACHE:
         rng = np.random.default_rng(7); TH, TW = 110, 190; base = np.array([int(bg[i:i + 2], 16) for i in (1, 3, 5)], np.float32)
         out = []
@@ -1717,7 +2628,7 @@ class Splitter(tk.Frame):
         ph, pw = 46, 12                                                                    # grip pill
         g.create_polygon(cx - pw / 2, cy - ph / 2 + 4, cx - pw / 2 + 4, cy - ph / 2, cx + pw / 2 - 4, cy - ph / 2, cx + pw / 2, cy - ph / 2 + 4,
                          cx + pw / 2, cy + ph / 2 - 4, cx + pw / 2 - 4, cy + ph / 2, cx - pw / 2 + 4, cy + ph / 2, cx - pw / 2, cy + ph / 2 - 4,
-                         fill=lerp(PANEL, "#2A1606", on), outline=lerp(RED_DIM, ORANGE, on))
+                         fill=lerp(PANEL, T("#2A1606"), on), outline=lerp(RED_DIM, ORANGE, on))
         col = lerp(RED, ORANGE, on)
         for d in (-1, 1):                                                                  # ◂ ▸ chevrons
             yy = cy + d * 11
@@ -1793,21 +2704,24 @@ class RowCard:
         tw = self.tw = tk.Toplevel(self.owner); tw.overrideredirect(True); tw.attributes("-topmost", True); tw.configure(bg=RED)
         try: tw.attributes("-alpha", 0.0)
         except Exception: pass
-        box = tk.Frame(tw, bg="#0B0C10"); box.pack(padx=1, pady=1)
-        tk.Label(box, text="◢ " + info["name"].upper(), bg="#0B0C10", fg=ORANGE, font=(MONO, 10, "bold"), anchor="w", padx=10).pack(fill="x", pady=(7, 2))
+        box = tk.Frame(tw, bg=T("#0B0C10")); box.pack(padx=1, pady=1)
+        big = getattr(self.owner, "icon_for", lambda *a: None)(info.get("icon"), 56)
+        top = tk.Frame(box, bg=T("#0B0C10")); top.pack(fill="x", pady=(7, 2))
+        if big: tk.Label(top, image=big, bg=T("#0B0C10")).pack(side="left", padx=(10, 0))       # the stratagem icon, big
+        tk.Label(top, text="◢ " + info["name"].upper(), bg=T("#0B0C10"), fg=ORANGE, font=(MONO, 10, "bold"), anchor="w", padx=10).pack(side="left", fill="x")
         if info.get("code"):
-            cv = tk.Canvas(box, height=26, width=max(120, 22 * len(info["code"]) + 20), bg="#0B0C10", highlightthickness=0); cv.pack(anchor="w", padx=10, pady=(0, 4))
+            cv = tk.Canvas(box, height=26, width=max(120, 22 * len(info["code"]) + 20), bg=T("#0B0C10"), highlightthickness=0); cv.pack(anchor="w", padx=10, pady=(0, 4))
             for k, d in enumerate(info["code"]): draw_arrow(cv, 18 + k * 22, 13, 8, d, ORANGE)
-        tk.Label(box, text="SAY ANY OF THESE", bg="#0B0C10", fg=RED_DIM, font=(MONO, 8, "bold"), anchor="w", padx=10).pack(fill="x")
+        tk.Label(box, text="SAY ANY OF THESE", bg=T("#0B0C10"), fg=RED_DIM, font=(MONO, 8, "bold"), anchor="w", padx=10).pack(fill="x")
         ph = info.get("phrases") or ["—"]; cols = 2 if len(ph) > 6 else 1
-        grid = tk.Frame(box, bg="#0B0C10"); grid.pack(fill="x", padx=10, pady=(2, 4))
+        grid = tk.Frame(box, bg=T("#0B0C10")); grid.pack(fill="x", padx=10, pady=(2, 4))
         for k, p in enumerate(ph):
-            tk.Label(grid, text="▸ " + p, bg="#0B0C10", fg=WHITE, font=(MONO, 9), anchor="w").grid(row=k // cols, column=k % cols, sticky="w", padx=(0, 18))
+            tk.Label(grid, text="▸ " + p, bg=T("#0B0C10"), fg=WHITE, font=(MONO, 9), anchor="w").grid(row=k // cols, column=k % cols, sticky="w", padx=(0, 18))
         acts = [pretty_action(a) for a in info.get("actions", []) if not a.startswith("#")]
         if acts and not info.get("code"):
-            tk.Label(box, text="DOES", bg="#0B0C10", fg=RED_DIM, font=(MONO, 8, "bold"), anchor="w", padx=10).pack(fill="x")
-            tk.Label(box, text="\n".join(acts), bg="#0B0C10", fg=ORANGE, font=(MONO, 9), anchor="w", justify="left", padx=10).pack(fill="x", pady=(0, 4))
-        tk.Label(box, text="double-click to edit", bg="#0B0C10", fg=DIM, font=(MONO, 8), anchor="w", padx=10).pack(fill="x", pady=(0, 6))
+            tk.Label(box, text="DOES", bg=T("#0B0C10"), fg=RED_DIM, font=(MONO, 8, "bold"), anchor="w", padx=10).pack(fill="x")
+            tk.Label(box, text="\n".join(acts), bg=T("#0B0C10"), fg=ORANGE, font=(MONO, 9), anchor="w", justify="left", padx=10).pack(fill="x", pady=(0, 4))
+        tk.Label(box, text="double-click to edit", bg=T("#0B0C10"), fg=DIM, font=(MONO, 8), anchor="w", padx=10).pack(fill="x", pady=(0, 6))
         tw.update_idletasks(); self.place(x, y)
         def fade(i=1):
             if self.tw:
@@ -1868,6 +2782,7 @@ class HudList(tk.Frame, SmoothScroll):
         c.bind("<Button-1>", self.click); c.bind("<Double-Button-1>", lambda e: (self.card.hide(), self.on_open()))
         c.bind("<MouseWheel>", lambda e: (self.card.hide(), self.wheel(e))); c.bind("<Return>", lambda e: self.on_open()); c.bind("<Delete>", lambda e: self.on_delete())
         c.bind("<Up>", lambda e: self.step(-1)); c.bind("<Down>", lambda e: self.step(1))
+        c.tag_bind("spk", "<Button-1>", self.speaker_click)
         self.after(60, self.pulse)
 
     def later(self):
@@ -1895,13 +2810,13 @@ class HudList(tk.Frame, SmoothScroll):
     def draw_head(self):
         h = self.head; h.delete("all"); x = 0; W = h.winfo_width()
         for k, ((title, _), w) in enumerate(zip(self.cols, self.widths())):
-            h.create_polygon(x + 3, 4, x + w - 10, 4, x + w - 4, 10, x + w - 4, 25, x + 3, 25, fill="#120707" if k % 2 == 0 else "#0E0E12", outline=RED_DIM)
+            h.create_polygon(x + 3, 4, x + w - 10, 4, x + w - 4, 10, x + w - 4, 25, x + 3, 25, fill=T("#120707") if k % 2 == 0 else T("#0E0E12"), outline=RED_DIM)
             h.create_text(x + 12, 15, text="◢ " + title, fill=ORANGE if k == 0 else RED, font=(MONO, 9, "bold"), anchor="w"); x += w
 
     def redraw(self):
         self.job = None; c = self.c; c.delete("row"); W = c.winfo_width(); ws = self.widths(); R = self.ROW; self.lit = {}
         H = max(c.winfo_height(), len(self.rows) * R)
-        c.create_rectangle(0, 0, ws[0], H, fill="#110909", outline="", tags=("row", "colband"))       # COMMAND column band
+        c.create_rectangle(0, 0, ws[0], H, fill=T("#110909"), outline="", tags=("row", "colband"))       # COMMAND column band
         x = 0
         for w in ws[:-1]:
             x += w; c.create_line(x, 0, x, H, fill=lerp(PANEL, RED_DIM, 0.75), tags=("row",))           # column separators
@@ -1915,11 +2830,12 @@ class HudList(tk.Frame, SmoothScroll):
                     ph = info["phrases"]; more = len(ph) - 2
                     badge = f"+{more}" if more > 0 else ""
                     bw = self.fonts.measure(badge) + 10 if badge else 0
-                    c.create_text(tx, cy, text=self.fit(" · ".join(ph[:2]), w - 26 - bw, self.font), fill="#C8CCD6" if on else lerp(DIM, PANEL, 0.3),
+                    c.create_text(tx, cy, text=self.fit(" · ".join(ph[:2]), w - 50 - bw, self.font), fill=T("#C8CCD6") if on else lerp(DIM, PANEL, 0.3),
                                   font=self.font, anchor="w", tags=("row", f"t{n}"))
+                    self.speaker(x + w - 20, cy, n)                 # ♪ hear how to say it
                     if badge:
-                        bx = x + w - bw - 8
-                        c.create_rectangle(bx, cy - 8, bx + bw, cy + 8, fill="#2A1606", outline=RED_DIM, tags=("row",))
+                        bx = x + w - bw - 34
+                        c.create_rectangle(bx, cy - 8, bx + bw, cy + 8, fill=T("#2A1606"), outline=RED_DIM, tags=("row",))
                         c.create_text(bx + bw / 2, cy, text=badge, fill=ORANGE, font=self.fonts, tags=("row",))
                 elif k == 2 and info.get("code"):                      # animated stratagem arrows
                     c.create_polygon(tx, cy, tx + 4, cy - 4, tx + 8, cy, tx + 4, cy + 4, fill=RED if on else GRID, outline="", tags=("row",))
@@ -1929,7 +2845,13 @@ class HudList(tk.Frame, SmoothScroll):
                 else:
                     col = (WHITE if k == 0 else DIM) if on else lerp(DIM, PANEL, 0.3)
                     f = self.fontb if k == 0 else self.font
-                    c.create_text(tx, cy, text=self.fit(str(v), w - 22, f), fill=col, font=f, anchor="w", tags=("row", f"t{n}"))
+                    used = 0
+                    if k == 0:                                   # how many times this command was used: x12 badge on the left
+                        self.count_badge(n, info.get("count", 0)); tx += 40; used = 40
+                        img = getattr(self, "icon_for", lambda *a: None)(info.get("icon"))
+                        if img:                                  # the stratagem's icon
+                            c.create_image(tx + 13, cy, image=img, tags=("row", f"ic{n}")); tx += 32; used += 32
+                    c.create_text(tx, cy, text=self.fit(str(v), w - 22 - used, f), fill=col, font=f, anchor="w", tags=("row", f"t{n}"))
                 x += w
             c.create_line(6, y + R - 1, W - 6, y + R - 1, fill=lerp(PANEL, GRID, 0.6), tags=("row",))
         c.config(scrollregion=(0, 0, W, H))
@@ -1938,14 +2860,51 @@ class HudList(tk.Frame, SmoothScroll):
     def index_of(self, iid):
         return next((n for n, r in enumerate(self.rows) if r[0] == iid), None)
 
+    def speaker(self, x, y, n, col=None):
+        """small speaker icon - click = read this command aloud (pronunciation)"""
+        c = self.c; c.delete(f"spk{n}"); col = col or lerp(DIM, RED, 0.35); tg = ("row", "spk", f"spk{n}")
+        c.create_rectangle(x - 9, y - 9, x + 9, y + 9, fill=PANEL, outline="", tags=tg)                 # bigger click area
+        c.create_polygon(x - 6, y - 2, x - 3, y - 2, x + 1, y - 6, x + 1, y + 6, x - 3, y + 2, x - 6, y + 2, fill=col, outline="", tags=tg)
+        c.create_arc(x - 2, y - 5, x + 6, y + 5, start=-50, extent=100, style="arc", outline=col, tags=tg)
+        c.create_arc(x - 4, y - 8, x + 9, y + 8, start=-50, extent=100, style="arc", outline=col, tags=tg)
+
+    def speaker_click(self, e):
+        n = int(self.c.canvasy(e.y) // self.ROW)
+        if 0 <= n < len(self.rows) and getattr(self, "on_speak", None):
+            cy = n * self.ROW + self.ROW / 2; x = self.widths()[0] + self.widths()[1] - 20
+            self.speaker(x, cy, n, ORANGE); self.after(900, lambda: self.speaker(x, cy, n)); self.on_speak(self.rows[n][0])
+
+    def count_badge(self, n, cnt, glow=0.0):
+        """the xN use counter of row n (empty slot while never used)"""
+        c = self.c; c.delete(f"cnt{n}"); cy = n * self.ROW + self.ROW / 2
+        if cnt <= 0:
+            c.create_text(26, cy, text="·", fill=GRID, font=self.fonts, tags=("row", f"cnt{n}")); return
+        tier = ORANGE if cnt >= 50 else RED if cnt >= 10 else lerp(RED_DIM, RED, 0.6)
+        txt = f"x{cnt}" if cnt < 1000 else f"x{cnt // 1000}k"
+        c.create_polygon(8, cy - 8, 40, cy - 8, 44, cy - 4, 44, cy + 8, 12, cy + 8, 8, cy + 4, fill=lerp(T("#1C0909"), ORANGE, glow * 0.8),
+                         outline=lerp(tier, WHITE, glow), tags=("row", f"cnt{n}"))
+        c.create_text(26, cy, text=txt, fill=lerp(tier, BG if glow > 0.5 else WHITE, glow), font=self.fonts, tags=("row", f"cnt{n}"))
+
+    def set_count(self, iid, cnt):
+        """a command was used: update its badge with a short flash (no full redraw)"""
+        n = self.index_of(iid)
+        if n is None: return
+        self.rows[n][3]["count"] = cnt
+        def fl(g):
+            try:
+                self.count_badge(n, cnt, g)
+                if g > 0.05: self.after(60, lambda: fl(g * 0.75))
+            except tk.TclError: pass
+        fl(1.0)
+
     def paint(self):
         c = self.c; c.delete("mark"); R = self.ROW
         for n in range(len(self.rows)): c.itemconfig(f"bg{n}", fill="", stipple="")
         hn = self.index_of(self.hover) if self.hover is not None else None
-        if hn is not None and self.hover != self.sel: c.itemconfig(f"bg{hn}", fill="#2A0C0C", stipple="gray50")
+        if hn is not None and self.hover != self.sel: c.itemconfig(f"bg{hn}", fill=T("#2A0C0C"), stipple="gray50")
         sn = self.index_of(self.sel) if self.sel is not None else None
         if sn is not None:
-            y = sn * R; c.itemconfig(f"bg{sn}", fill="#3A0E0E", stipple="gray75")
+            y = sn * R; c.itemconfig(f"bg{sn}", fill=T("#3A0E0E"), stipple="gray75")
             c.create_rectangle(1, y + 2, 4, y + R - 2, fill=ORANGE, outline="", tags=("mark",))
             self.brackets(sn)
 
@@ -1973,7 +2932,7 @@ class HudList(tk.Frame, SmoothScroll):
                         state = tuple(WHITE if q == j else (lerp(ORANGE, WHITE, 0.45) if q == j - 1 else ORANGE) for q in range(len(code)))
                     else:
                         g = max(0.0, 1 - abs(n - wave) / 1.6) if (t % 7.0) < 2.2 else 0.0
-                        state = tuple(lerp(ORANGE, "#FFD7A8", g) for _ in code)
+                        state = tuple(lerp(ORANGE, T("#FFD7A8"), g) for _ in code)
                     if self.lit.get(n) != state:
                         for j, col in enumerate(state): c.itemconfig(f"a{n}_{j}", fill=col)
                         self.lit[n] = state
@@ -2045,6 +3004,7 @@ class LogView(tk.Frame, SmoothScroll):
         self.finish(True)
 
     def add(self, ts, text, tag, link=None):
+        text = tr(text)
         at_end = self.c.yview()[1] >= 0.98
         self.data.append((ts, text, tag, link))
         if len(self.data) > 400: self.data = self.data[-300:]; self.relayout(); return
@@ -2072,7 +3032,7 @@ class LogView(tk.Frame, SmoothScroll):
 
     def hl(self, n, on, col):
         c = self.c
-        c.itemconfig(f"h{n}", fill="#2A1606" if on else "", stipple="gray50" if on else "", outline=ORANGE if on else "")
+        c.itemconfig(f"h{n}", fill=T("#2A1606") if on else "", stipple="gray50" if on else "", outline=ORANGE if on else "")
         c.itemconfig(f"x{n}", fill=WHITE if on else col); c.config(cursor="hand2" if on else "")
 
     def fade(self, n, col, k):
@@ -2085,7 +3045,7 @@ class LogView(tk.Frame, SmoothScroll):
 class Chip(tk.Canvas):
     """small selectable group pill"""
     def __init__(self, parent, text, on_pick, bg=BG):
-        self.f = tkfont.Font(family=MONO, size=9, weight="bold"); w = self.f.measure(text) + 22
+        self.f = tkfont.Font(family=MONO, size=9, weight="bold"); w = self.f.measure(tr(text)) + 22
         super().__init__(parent, width=w, height=24, bg=bg, highlightthickness=0, cursor="hand2")
         self.text, self.on_pick, self.on, self.h, self.bgc = text, on_pick, False, 0.0, bg
         self.bind("<Enter>", lambda e: self.set_h(1)); self.bind("<Leave>", lambda e: self.set_h(0))
@@ -2094,9 +3054,9 @@ class Chip(tk.Canvas):
     def set(self, on): self.on = on; self.draw()
     def draw(self):
         self.delete("all"); w, h = self.winfo_width(), self.winfo_height(); cut = 6
-        fill = ORANGE if self.on else (lerp(self.bgc, "#2A0C0C", self.h))
+        fill = ORANGE if self.on else (lerp(self.bgc, T("#2A0C0C"), self.h))
         self.create_polygon(1, 1, w - cut, 1, w - 1, cut, w - 1, h - 2, cut, h - 2, 1, h - cut, fill=fill, outline=ORANGE if (self.on or self.h) else RED_DIM)
-        self.create_text(w / 2, h / 2, text=self.text, fill=BG if self.on else (WHITE if self.h else "#B8BCC6"), font=self.f)
+        self.create_text(w / 2, h / 2, text=self.text, fill=BG if self.on else (WHITE if self.h else T("#B8BCC6")), font=self.f)
 
 
 class PadKey(tk.Canvas):
@@ -2115,7 +3075,7 @@ class PadKey(tk.Canvas):
         except tk.TclError: pass
     def draw(self):
         self.delete("all"); s = self.winfo_width(); f, h = self.flash, self.h
-        edge = lerp(lerp(RED_DIM, ORANGE, h), WHITE, f); fill = lerp(lerp(PANEL, "#2A1606", h), ORANGE, f * 0.8)
+        edge = lerp(lerp(RED_DIM, ORANGE, h), WHITE, f); fill = lerp(lerp(PANEL, T("#2A1606"), h), ORANGE, f * 0.8)
         self.create_rectangle(3, 3, s - 3, s - 3, fill=fill, outline=edge, width=2)
         self.create_line(6, s - 6, s - 6, s - 6, fill=lerp(edge, BG, 0.5))
         col = lerp(ORANGE if h else RED, BG if f > 0.5 else WHITE, f)
@@ -2126,8 +3086,8 @@ class PadKey(tk.Canvas):
 
 
 # ======================================================================  dialog look: nanosuit armour + modern controls
-CARD = "#0A0C11"
-SECTION_ICON = {"listening": "mic", "macros": "gauge", "sound": "listen", "speech ai": "cpu", "stratagem keys": "arrows", "speed": "gauge"}
+CARD = T("#0A0C11")
+SECTION_ICON = {"look": "detect", "listening": "mic", "macros": "gauge", "sound": "listen", "speech ai": "cpu", "stratagem keys": "arrows", "speed": "gauge"}
 
 
 class Toggle(tk.Canvas):
@@ -2151,14 +3111,14 @@ class Toggle(tk.Canvas):
         self.delete("all"); k, h, t = self.k, self.h, time.time()
         W, H = 56, 24; c = 6
         edge = lerp(lerp(GRID, ORANGE, k), WHITE, 0.25 * h)
-        self.create_polygon(2, 3, W - c, 3, W - 1, 3 + c, W - 1, H - 3, 2 + c, H - 3, 2, H - 3 - c, fill=lerp(PANEL, "#2E1406", k), outline=edge)
+        self.create_polygon(2, 3, W - c, 3, W - 1, 3 + c, W - 1, H - 3, 2 + c, H - 3, 2, H - 3 - c, fill=lerp(PANEL, T("#2E1406"), k), outline=edge)
         for q in range(5):                                       # energy cells inside the track
             x = 9 + q * 5; on = k > 0.5
             pulse = (0.5 + 0.5 * math.sin(t * 6 - q)) if h else 0.7
             self.create_line(x, 8, x, H - 8, fill=lerp(GRID, ORANGE, k * (0.4 + 0.6 * pulse)) if on else GRID)
         kx = 4 + k * (W - 26)
         self.create_polygon(kx, 5, kx + 17, 5, kx + 20, 8, kx + 20, H - 5, kx + 3, H - 5, kx, H - 8, fill=lerp(DIM, ORANGE, k), outline="")
-        self.create_line(kx + 7, 9, kx + 7, H - 9, fill=lerp(BG, "#5A2A08", k)); self.create_line(kx + 12, 9, kx + 12, H - 9, fill=lerp(BG, "#5A2A08", k))
+        self.create_line(kx + 7, 9, kx + 7, H - 9, fill=lerp(BG, T("#5A2A08"), k)); self.create_line(kx + 12, 9, kx + 12, H - 9, fill=lerp(BG, T("#5A2A08"), k))
         if k < 0.4: self.create_text(W - 16, H / 2, text="OFF", fill=lerp(DIM, WHITE, 0.3 * h), font=(MONO, 6, "bold"))
 
 
@@ -2218,7 +3178,7 @@ class Segmented(tk.Canvas):
     """2-4 choices side by side (replaces short dropdowns: always / ptt, auto / gpu / cpu ...)"""
     def __init__(self, parent, var, values, bg=CARD):
         self.f = tkfont.Font(family=MONO, size=9, weight="bold")
-        self.ws = [max(46, self.f.measure(v.upper()) + 22) for v in values]
+        self.ws = [max(46, self.f.measure(tr(v.upper())) + 22) for v in values]      # measured in the shown language
         super().__init__(parent, width=sum(self.ws) + 4, height=26, bg=bg, highlightthickness=0, cursor="hand2")
         self.var, self.values, self.bgc, self.hov = var, list(values), bg, None
         self.bind("<Motion>", lambda e: self.set_hov(self.at(e.x))); self.bind("<Leave>", lambda e: self.set_hov(None))
@@ -2243,8 +3203,8 @@ class Segmented(tk.Canvas):
             pts = (x + 1, 2, x + w - 1, 2, x + w - 1, H - 2, x + 1, H - 2)
             if k == 0: pts = (x + 1, 2 + c, x + 1 + c, 2, x + w - 1, 2, x + w - 1, H - 2, x + 1, H - 2)
             if k == len(self.values) - 1: pts = (x + 1, 2, x + w - 1, 2, x + w - 1, H - 2 - c, x + w - 1 - c, H - 2, x + 1, H - 2)
-            self.create_polygon(*pts, fill=ORANGE if on else ("#2A0C0C" if hv else PANEL), outline=ORANGE if on or hv else RED_DIM)
-            self.create_text(x + w / 2, H / 2, text=v.upper(), fill=BG if on else (WHITE if hv else "#B8BCC6"), font=self.f)
+            self.create_polygon(*pts, fill=ORANGE if on else (T("#2A0C0C") if hv else PANEL), outline=ORANGE if on or hv else RED_DIM)
+            self.create_text(x + w / 2, H / 2, text=tr(v.upper()), fill=BG if on else (WHITE if hv else T("#B8BCC6")), font=self.f)
             x += w
 
 
@@ -2265,8 +3225,8 @@ class HudSelect(tk.Canvas):
         except tk.TclError: pass
     def draw(self):
         self.delete("all"); W, H, h, t = self.W, 28, max(self.h, 1.0 if self.pop else 0.0), time.time()
-        self.create_polygon(1, 1, W - 8, 1, W - 1, 8, W - 1, H - 2, 8, H - 2, 1, H - 9, fill=lerp(PANEL, "#1C0909", h), outline=lerp(GRID, ORANGE, h))
-        txt = self.var.get(); maxw = W - 40
+        self.create_polygon(1, 1, W - 8, 1, W - 1, 8, W - 1, H - 2, 8, H - 2, 1, H - 9, fill=lerp(PANEL, T("#1C0909"), h), outline=lerp(GRID, ORANGE, h))
+        txt = tr(self.var.get()); maxw = W - 40
         while txt and self.f.measure(txt) > maxw: txt = txt[:-2] + "…" if len(txt) > 2 else ""
         self.create_text(10, H / 2, text=txt, fill=WHITE, font=self.f, anchor="w")
         cx, cy, b = W - 16, H / 2 + (1.5 * math.sin(t * 4) if h else 0), 4
@@ -2278,13 +3238,13 @@ class HudSelect(tk.Canvas):
         sfx("open"); top = self.winfo_toplevel()
         p = self.pop = tk.Toplevel(self); p.overrideredirect(True); p.attributes("-topmost", True); p.configure(bg=RED)
         n = min(10, len(self.values)); fr = tk.Frame(p, bg=PANEL); fr.pack(padx=1, pady=1)
-        lb = tk.Listbox(fr, bg=PANEL, fg="#C9CDD6", selectbackground="#3A0E0E", selectforeground=ORANGE, font=(MONO, 10), height=n,
+        lb = tk.Listbox(fr, bg=PANEL, fg=T("#C9CDD6"), selectbackground=T("#3A0E0E"), selectforeground=ORANGE, font=(MONO, 10), height=n,
                         activestyle="none", highlightthickness=0, bd=0, relief="flat", exportselection=False,
                         width=max(8, int((self.W - 20) / max(1, self.f.measure("0")))))
         lb.pack(side="left", padx=(6, 0), pady=4)
         if len(self.values) > n:
             sb = ttk.Scrollbar(fr, orient="vertical", command=lb.yview); sb.pack(side="right", fill="y"); lb.config(yscrollcommand=sb.set)
-        for v in self.values: lb.insert("end", "  " + v)
+        for v in self.values: lb.insert("end", "  " + tr(v))
         if self.var.get() in self.values:
             i = self.values.index(self.var.get()); lb.selection_set(i); lb.see(i)
         lb.bind("<Motion>", lambda e: (lb.selection_clear(0, "end"), lb.selection_set(lb.nearest(e.y))))
@@ -2306,6 +3266,9 @@ class HudSelect(tk.Canvas):
         self.pop = None
 
 
+_ICON_HANDLES = []   # keep the icon handles alive
+
+
 def set_win_icon(win, ico):
     """sharp taskbar / Alt+Tab icon at this screen's DPI (a borderless window gets no icon otherwise)"""
     if not WIN or not ico: return
@@ -2324,6 +3287,224 @@ def set_win_icon(win, ico):
         _ICON_HANDLES.extend([hb, hs])
     except Exception:
         traceback.print_exc()
+
+
+# ======================================================================  stats: per-command uses, combo, 50 ranks
+STATS_FILE = os.path.join(HERE, "stats.json")
+RANK_TIERS = (["REKRUT", "FUSSSOLDAT", "SPECTRE", "SPECTRE-FW", "FELDOFFIZIER", "LEUTNANT", "KOMMANDANT", "OBERST", "ORION-SOLDAT", "GENERAL"]
+              if THEME == "blackwatch" and APP_LANG == "de" else
+              ["REKRUT", "KADETT", "SOLDAT", "GEFREITER", "FELDWEBEL", "LEUTNANT", "HAUPTMANN", "MAJOR", "KOMMANDANT", "OBERHERR"] if APP_LANG == "de" else
+              ["RECRUIT", "FOOT SOLDIER", "SPECTRE", "SPECTRE SGT", "FIELD OFFICER", "LIEUTENANT", "COMMANDER", "COLONEL",
+               "ORION SOLDIER", "GENERAL"] if THEME == "blackwatch" else
+              ["RECRUIT", "CADET", "TROOPER", "CORPORAL", "SERGEANT", "LIEUTENANT", "CAPTAIN", "MAJOR", "COMMANDER", "OVERLORD"])
+RANKS = [f"{t} {r}" for t in RANK_TIERS for r in ("I", "II", "III", "IV", "V")]          # 50 ranks
+COMBO_WINDOW = 120.0          # seconds between two successful commands before the combo breaks
+
+
+def rank_xp(level):
+    """successful commands needed to reach a level (1..50): 4, 12, 22 ... ~2000 for level 50"""
+    return 0 if level <= 1 else int(round(4 * (level - 1) ** 1.6))
+
+
+def rank_of(total):
+    """(level 1-50, name, commands into this level, commands this level needs)"""
+    lv = 1
+    while lv < 50 and total >= rank_xp(lv + 1): lv += 1
+    if lv == 50: return 50, RANKS[49], 1, 1
+    return lv, RANKS[lv - 1], total - rank_xp(lv), rank_xp(lv + 1) - rank_xp(lv)
+
+
+class Stats:
+    """counts every successful command (per profile + command), the total and the best combo; kept in stats.json"""
+    def __init__(self):
+        self.lock = threading.Lock(); self.data = {"total": 0, "best_combo": 0, "per": {}}
+        try:
+            with open(STATS_FILE, encoding="utf-8") as f: d = json.load(f)
+            if isinstance(d, dict): self.data.update({k: d[k] for k in ("total", "best_combo", "per") if k in d})
+        except (OSError, ValueError): pass
+
+    @staticmethod
+    def key(prof, name): return f"{prof}|{name}"
+
+    def move(self, old, new, names):
+        """German profile got its own name -> carry its German command counts over (English counts stay where they are)"""
+        with self.lock:
+            per = self.data["per"]
+            for n in names:
+                k = self.key(old, n)
+                if k in per: per[self.key(new, n)] = per.get(self.key(new, n), 0) + per.pop(k)
+            self.save()
+
+    def rename(self, prof, names):
+        """commands got new names -> their counts follow them"""
+        with self.lock:
+            per = self.data["per"]
+            for old, new in names.items():
+                k = self.key(prof, old)
+                if k in per: per[self.key(prof, new)] = per.get(self.key(prof, new), 0) + per.pop(k)
+            self.save()
+
+    def count(self, prof, name): return int(self.data["per"].get(self.key(prof, name), 0))
+
+    def hit(self, prof, name):
+        """one more successful command -> (its count, total, new level or 0)"""
+        with self.lock:
+            before = rank_of(self.data["total"])[0]
+            k = self.key(prof, name); self.data["per"][k] = self.data["per"].get(k, 0) + 1; self.data["total"] += 1
+            after = rank_of(self.data["total"])[0]; self.save()
+            return self.data["per"][k], self.data["total"], after if after > before else 0
+
+    def best(self, combo):
+        with self.lock:
+            if combo > self.data["best_combo"]: self.data["best_combo"] = combo; self.save()
+
+    def save(self):
+        try:
+            tmp = STATS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f: json.dump(self.data, f)
+            os.replace(tmp, STATS_FILE)
+        except OSError: pass
+
+
+class ComboPanel(tk.Canvas):
+    """above the command log: COMBO xN (with a draining timer), TOTAL / BEST, and the rank with its progress bar.
+    Big flash on x5 / x10 / x15… milestones and on rank-ups. Draws only while something moves."""
+    H = 62
+
+    def __init__(self, parent, app):
+        super().__init__(parent, height=self.H, bg=BG, highlightthickness=0, cursor="hand2")
+        self.app, self.combo, self.last, self.flash, self.banner, self.banner_t, self.drawn = app, 0, 0.0, 0.0, "", 0.0, None
+        self.bind("<Button-1>", self.click)
+        self.fbig = (MONO, 20, "bold"); self.fmid = (MONO, 11, "bold"); self.fsm = (MONO, 7, "bold")
+        Tip(self, "Combo & rank\nCOMBO = successful commands in a row (a miss or 2 minutes without a command breaks it)\n"
+                  "TOTAL = every successful command ever · BEST = your longest combo\n50 ranks - every successful command is 1 XP\nclick to see every rank")
+        self.bind("<Configure>", lambda e: self.draw()); self.after(200, self.tick)
+
+    def success(self):
+        now = time.time()
+        if now - self.last > COMBO_WINDOW: self.combo = 0
+        self.combo += 1; self.last = now; self.flash = 1.0; self.app.stats.best(self.combo)
+        if self.combo % 5 == 0:
+            self.show(f"x{self.combo} COMBO!"); self.app.play("detect", "cmd")
+
+    def miss(self):
+        if self.combo >= 3: self.show(f"COMBO x{self.combo} LOST")
+        self.combo = 0; self.draw()
+
+    def level_up(self, lv):
+        self.show(f"RANK UP · {RANKS[lv - 1]}"); self.app.play("unlocked", "cmd")
+        self.app.log(f"▲ RANK UP - level {lv}: {RANKS[lv - 1]}", "ok")
+
+    def show(self, text): self.banner, self.banner_t = text, time.time(); self.draw()
+
+    def click(self, e):
+        if e.x >= 200: self.app.rank_side.toggle()          # the rank part of the panel opens the rank side tab
+
+    def open_board(self): self.app.rank_side.toggle()
+
+
+    def tick(self):
+        try:
+            busy = self.flash > 0.01 or time.time() - self.banner_t < 1.6 or (self.combo and time.time() - self.last < COMBO_WINDOW)
+            if self.combo and time.time() - self.last >= COMBO_WINDOW: self.combo = 0; self.draw()
+            if busy and not PAUSED[0]: self.flash *= 0.85; self.draw()
+            self.after(80 if busy and not PAUSED[0] else 600, self.tick)
+        except tk.TclError: pass
+
+    def draw(self):
+        c = self; c.delete("all"); W, H = c.winfo_width(), self.H; t = time.time(); f = self.flash
+        st = self.app.stats.data; total = st["total"]; lv, name, have, need = rank_of(total)
+        c.create_polygon(1, 3, W - 12, 3, W - 2, 13, W - 2, H - 3, 12, H - 3, 1, H - 13, fill=lerp(T("#0B0C10"), T("#2A0C0C"), f * 0.7), outline=lerp(RED_DIM, ORANGE, f))
+        # combo
+        c.create_text(14, 14, text="COMBO", fill=DIM, font=self.fsm, anchor="w")
+        col = lerp(RED if self.combo < 5 else ORANGE, WHITE, f)
+        c.create_text(12 - 2 * f, 37, text=f"x{self.combo}", fill=col if self.combo else GRID, font=self.fbig, anchor="w")
+        if self.combo:                                   # draining combo timer
+            left = max(0.0, 1 - (t - self.last) / COMBO_WINDOW); c.create_rectangle(14, H - 10, 14 + 90 * left, H - 7, fill=lerp(RED_DIM, ORANGE, left), outline="")
+        # total / best
+        x = 120
+        c.create_line(x - 8, 10, x - 8, H - 10, fill=RED_DIM)
+        c.create_text(x, 14, text="TOTAL", fill=DIM, font=self.fsm, anchor="w"); c.create_text(x, 31, text=f"{total}", fill=WHITE, font=self.fmid, anchor="w")
+        c.create_text(x, 47, text=f"BEST x{st['best_combo']}", fill=RED, font=self.fsm, anchor="w")
+        # rank: chevrons (tier) + level + name + xp bar
+        x = 210; c.create_line(x - 8, 10, x - 8, H - 10, fill=RED_DIM)
+        tier = (lv - 1) // 5; pips = (lv - 1) % 5 + 1
+        for k in range(min(3, tier // 3 + 1)):           # 1-3 chevrons for the tier group
+            y = 18 + k * 9; c.create_line(x, y + 6, x + 9, y, x + 18, y + 6, fill=ORANGE if k == 0 else RED, width=3)
+        for k in range(5):                               # 5 pips = sub-rank I..V
+            c.create_rectangle(x + k * 4, H - 14, x + k * 4 + 2, H - 9, fill=ORANGE if k < pips else GRID, outline="")
+        c.create_text(x + 30, 15, text=f"LV {lv}", fill=ORANGE, font=self.fmid, anchor="w")
+        c.create_text(x + 30, 32, text=name, fill=WHITE, font=(MONO, 9, "bold"), anchor="w")
+        bw = max(40, W - x - 44)
+        c.create_rectangle(x + 30, 44, x + 30 + bw, 49, fill=GRID, outline="")
+        c.create_rectangle(x + 30, 44, x + 30 + bw * min(1, have / max(1, need)), 49, fill=lerp(RED, ORANGE, have / max(1, need)), outline="")
+        c.create_text(x + 30 + bw, 55, text="MAX RANK" if lv == 50 else f"{have}/{need} XP", fill=DIM, font=self.fsm, anchor="e")
+        # milestone / rank-up banner
+        age = t - self.banner_t
+        if age < 1.6 and self.banner:
+            a = 1 - age / 1.6; cx = W / 2
+            c.create_rectangle(cx - 130, H / 2 - 14, cx + 130, H / 2 + 14, fill=lerp(BG, T("#2A1606"), a), outline=lerp(BG, ORANGE, a), width=2)
+            c.create_text(cx + random.uniform(-1, 1) * a, H / 2, text=self.banner, fill=lerp(BG, WHITE, a), font=(MONO, 13, "bold"))
+
+
+def draw_rank_board(c, Wd, total):
+    """all 50 ranks on a canvas: one row per rank group, five steps each - done / current / still to earn, with the XP each needs"""
+    lv = rank_of(total)[0]; RW, X0, Y0 = 36, 150, 64; CW = (Wd - X0 - 16) / 5; Hd = Y0 + 10 * RW + 34
+    c.create_text(16, 20, text="◢ RANKS", fill=RED, font=(MONO, 12, "bold"), anchor="w")
+    c.create_text(Wd - 52, 20, text=f"LV {lv} · {total} XP", fill=ORANGE, font=(MONO, 9, "bold"), anchor="e")
+    c.create_text(16, 40, text=RANKS[lv - 1], fill=WHITE, font=(MONO, 9, "bold"), anchor="w")
+    for k, r in enumerate(("I", "II", "III", "IV", "V")):
+        c.create_text(X0 + k * CW + CW / 2, Y0 - 10, text=r, fill=DIM, font=(MONO, 8, "bold"))
+    for g, tier in enumerate(RANK_TIERS):
+        y = Y0 + g * RW; first = g * 5 + 1; got = lv >= first
+        c.create_text(16, y + RW / 2, text=tier, fill=(WHITE if lv >= first + 5 else RED) if got else DIM, font=(MONO, 9, "bold"), anchor="w")
+        for k in range(5):
+            n = first + k; x = X0 + k * CW; done, cur = n < lv, n == lv
+            fill = T("#2A1606") if cur else (lerp(T("#0B0C10"), RED_DIM, 0.55) if done else T("#101218"))
+            c.create_polygon(x + 3, y + 4, x + CW - 9, y + 4, x + CW - 3, y + 10, x + CW - 3, y + RW - 4, x + 9, y + RW - 4, x + 3, y + RW - 10,
+                             fill=fill, outline=ORANGE if cur else (RED if done else GRID), width=2 if cur else 1)
+            c.create_text(x + CW / 2, y + 13, text=f"LV {n}", fill=ORANGE if cur else (WHITE if done else DIM), font=(MONO, 8, "bold"))
+            c.create_text(x + CW / 2, y + 25, text="✔" if done else ("◀ YOU" if cur else f"{rank_xp(n)} XP"),
+                          fill=GREEN if done else (ORANGE if cur else DIM), font=(MONO, 7, "bold"))
+    nxt = rank_xp(lv + 1) - total if lv < 50 else 0
+    c.create_text(16, Hd - 16, text=(f"next rank in {nxt} successful command{'s' if nxt != 1 else ''}" if lv < 50 else "MAX RANK - you made it"),
+                  fill=DIM, font=(MONO, 8, "bold"), anchor="w")
+    return Hd
+
+
+class RankSide(tk.Frame):
+    """the rank board as a side tab of the main window: slides in from the right edge (click your rank / ✕ / Esc closes it)"""
+    W = 560
+
+    def __init__(self, app):
+        super().__init__(app.root, bg=RED, width=self.W)
+        self.app, self.open, self.pos, self.job = app, False, 0.0, None
+        self.c = tk.Canvas(self, bg=T("#0B0C10"), highlightthickness=0, width=self.W - 2); self.c.pack(fill="both", expand=True, padx=(1, 0), pady=1)
+        self.c.bind("<MouseWheel>", lambda e: self.c.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        self.c.bind("<Configure>", lambda e: self.draw())
+        self.c.tag_bind("x", "<Button-1>", lambda e: self.toggle())
+        app.root.bind("<Escape>", lambda e: self.open and self.toggle(), add="+")
+
+    def toggle(self):
+        self.open = not self.open; sfx("open" if self.open else "close")
+        if self.open: self.draw(); self.lift()
+        if not self.job: self.slide()
+
+    def slide(self):
+        """ease the panel in / out from the right edge of the window"""
+        self.job = None; tgt = 1.0 if self.open else 0.0; self.pos += (tgt - self.pos) * 0.35
+        if abs(tgt - self.pos) < 0.01: self.pos = tgt
+        top = self.app.hdr.winfo_height() + 4
+        if self.pos <= 0: self.place_forget(); return
+        self.place(relx=1.0, x=int(self.W * (1 - self.pos)), y=top, anchor="ne", width=self.W, relheight=1.0, height=-top - 8)
+        if self.pos != tgt: self.job = self.after(16, self.slide)
+
+    def draw(self):
+        c = self.c; c.delete("all"); Wd = max(300, c.winfo_width())
+        Hd = draw_rank_board(c, Wd, self.app.stats.data["total"])
+        x = Wd - 34; c.create_rectangle(x, 8, x + 24, 32, fill=T("#101218"), outline=RED_DIM, tags=("x",))
+        c.create_text(x + 12, 20, text="✕", fill=RED, font=(MONO, 11, "bold"), tags=("x",))
+        c.config(scrollregion=(0, 0, Wd, Hd))
 
 
 def make_borderless(win, appwindow=True):
@@ -2379,7 +3560,7 @@ class KeyField(tk.Frame):
     def start(self, e=None):
         if self.capturing or not WIN: return
         sfx("key"); self.capturing, self.pressed, self.armed, self.t0 = True, [], False, time.time()
-        self.lbl.config(text="press a key…", fg=ORANGE, bg="#2A1606", highlightbackground=ORANGE)
+        self.lbl.config(text="press a key…", fg=ORANGE, bg=T("#2A1606"), highlightbackground=ORANGE)
         self.after(15, self.poll)
 
     def poll(self):
@@ -2427,7 +3608,7 @@ class Dialog(tk.Toplevel):
 
     # ---------- cards
     def new_card(self, title):
-        outer = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground="#2A1010")
+        outer = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground=T("#2A1010"))
         if title: self._head(outer, title)
         self.body = tk.Frame(outer, bg=CARD); self.body.pack(fill="both", expand=True, padx=14, pady=(6 if title else 12, 12))
         self.body.columnconfigure(1, weight=1); self.row, self.c0 = 0, 0
@@ -2453,14 +3634,14 @@ class Dialog(tk.Toplevel):
         hc.delete("all"); W = hc.winfo_width(); ph = hc.ph
         draw_icon(hc, hc.icon, 10, 5, 20, lerp(RED, ORANGE, 0.5 + 0.5 * math.sin(t * 1.5 + ph)), t)
         hc.create_text(38, 15, text=hc.title, fill=RED, font=(MONO, 9, "bold"), anchor="w")
-        if not hasattr(hc, "tw"): hc.tw = tkfont.Font(family=MONO, size=9, weight="bold").measure(hc.title)
+        if not hasattr(hc, "tw"): hc.tw = tkfont.Font(family=MONO, size=9, weight="bold").measure(tr(hc.title))
         x0 = 46 + hc.tw; x1 = W - 12
         if x1 > x0 + 10:
-            hc.create_line(x0, 15, x1, 15, fill="#2A1010")
+            hc.create_line(x0, 15, x1, 15, fill=T("#2A1010"))
             p = x0 + ((t * 90 + ph * 40) % (x1 - x0 + 60)) - 30            # running energy dash
             hc.create_line(max(x0, p), 15, min(x1, p + 30), 15, fill=ORANGE, width=2) if p + 30 > x0 and p < x1 else None
             hc.create_rectangle(x1 - 3, 13, x1 + 1, 17, fill=RED_DIM, outline="")
-        hc.create_line(1, 29, W - 1, 29, fill="#1A1D25")
+        hc.create_line(1, 29, W - 1, 29, fill=T("#1A1D25"))
 
     def _draw_frame(self, t):
         c = self.cv; c.delete("ttl"); W, H = c.winfo_width(), c.winfo_height(); k = 14
@@ -2473,7 +3654,7 @@ class Dialog(tk.Toplevel):
         c.create_text(self.M + 2, 40, text="SKYNET COMMAND  //  " + ("CONFIG" if self.ttl == "OPTIONS" else "EDITOR"), fill=DIM, font=(MONO, 7, "bold"), anchor="w", tags=("ttl",))
         x0, x1 = self.M + 270, W - self.M - 40
         if x1 > x0:
-            c.create_line(x0, 30, x1, 30, fill="#2A1010", tags=("ttl",))
+            c.create_line(x0, 30, x1, 30, fill=T("#2A1010"), tags=("ttl",))
             p = x0 + (t * 160) % (x1 - x0 + 80) - 40
             c.create_line(max(x0, p), 30, min(x1, p + 60), 30, fill=RED, width=2, tags=("ttl",))
 
@@ -2512,12 +3693,12 @@ class Dialog(tk.Toplevel):
     # ---------- rows
     def label(self, text, hint=None):
         """row label; hovering the label or its control explains the setting"""
-        lb = tk.Label(self.body, text=text, bg=self.cbg, fg="#8A8F9C", font=(MONO, 9, "bold"), anchor="nw", justify="left", cursor="question_arrow" if hint else "")
+        lb = tk.Label(self.body, text=text, bg=self.cbg, fg=T("#8A8F9C"), font=(MONO, 9, "bold"), anchor="nw", justify="left", cursor="question_arrow" if hint else "")
         lb.grid(row=self.row, column=self.c0, sticky="nw", padx=(0, 12), pady=6)
-        self._tiptext = (text.replace("\n", " ") + ("\n" + hint if hint else "")) if hint else ""
+        self._tiptext = (tr(text).replace("\n", " ") + ("\n" + tr(hint) if hint else "")) if hint else ""
         if hint:
             Tip(lb, self._tiptext)
-            lb.bind("<Enter>", lambda e: lb.config(fg=ORANGE), add="+"); lb.bind("<Leave>", lambda e: lb.config(fg="#8A8F9C"), add="+")
+            lb.bind("<Enter>", lambda e: lb.config(fg=ORANGE), add="+"); lb.bind("<Leave>", lambda e: lb.config(fg=T("#8A8F9C")), add="+")
             dot = tk.Canvas(self.body, width=14, height=14, bg=self.cbg, highlightthickness=0); dot.grid(row=self.row, column=self.c0 + 2, sticky="nw", padx=(8, 0), pady=9)
             Tip(dot, self._tiptext); self._pulse(dot)
         return lb
@@ -2537,7 +3718,7 @@ class Dialog(tk.Toplevel):
 
     def entry(self, text, value, hint=None, width=34):
         self.label(text, hint); v = tk.StringVar(value=str(value))
-        e = tk.Entry(self.body, textvariable=v, bg="#07080B", fg=WHITE, insertbackground=ORANGE, relief="flat", font=(MONO, 10), width=width,
+        e = tk.Entry(self.body, textvariable=v, bg=T("#07080B"), fg=WHITE, insertbackground=ORANGE, relief="flat", font=(MONO, 10), width=width,
                      highlightthickness=1, highlightbackground=GRID, highlightcolor=ORANGE)
         e.grid(row=self.row, column=self.c0 + 1, sticky="we", pady=5, ipady=4); e.bind("<Button-1>", lambda ev: e.focus_force(), add="+"); self.tipped(e)
         self.row += 1; self.last = e; return v
@@ -2548,7 +3729,7 @@ class Dialog(tk.Toplevel):
 
     def text(self, label, value, height, hint=None):
         self.label(label + ("\n\n" + hint if hint else ""))
-        t = tk.Text(self.body, bg="#07080B", fg=WHITE, insertbackground=ORANGE, relief="flat", font=(MONO, 10), height=height, width=56,
+        t = tk.Text(self.body, bg=T("#07080B"), fg=WHITE, insertbackground=ORANGE, relief="flat", font=(MONO, 10), height=height, width=56,
                     highlightthickness=1, highlightbackground=GRID, highlightcolor=ORANGE, wrap="none", undo=True, padx=6, pady=4)
         t.insert("1.0", value); t.grid(row=self.row, column=self.c0 + 1, columnspan=2, sticky="nsew", pady=5)
         t.bind("<Button-1>", lambda ev: t.focus_force(), add="+")
@@ -2559,7 +3740,7 @@ class Dialog(tk.Toplevel):
         if editable:
             c = ttk.Combobox(self.body, textvariable=v, values=values, state="normal", width=width, font=(MONO, 10))
             c.bind("<<ComboboxSelected>>", lambda e: sfx("select"), add="+")
-        elif 1 < len(values) <= 4 and max(len(x) for x in values) <= 9:
+        elif 1 < len(values) <= 4 and max(len(x) for x in values) <= 10:
             c = Segmented(self.body, v, values, bg=self.cbg)
         else:
             c = HudSelect(self.body, v, values, width=min(width, 40), bg=self.cbg)
@@ -2593,7 +3774,8 @@ class Dialog(tk.Toplevel):
 
 
 
-GROUPS = ["General", "Mission", "Orbital", "Eagle", "Weapons", "Backpacks", "Sentries", "Emplacements", "Mines", "Vehicles", "Chat", "Desktop"]
+GROUPS = (["Allgemein", "Mission", "Orbital", "Adler", "Waffen", "Rucksäcke", "Geschütze", "Stellungen", "Minen", "Fahrzeuge", "Chat", "Desktop"] if APP_LANG == "de" else
+          ["General", "Mission", "Orbital", "Eagle", "Weapons", "Backpacks", "Sentries", "Emplacements", "Mines", "Vehicles", "Chat", "Desktop"])
 DIR_VK = {0x26: "U", 0x28: "D", 0x25: "L", 0x27: "R", 0x57: "U", 0x53: "D", 0x41: "L", 0x44: "R"}   # arrows + WASD
 
 
@@ -2800,7 +3982,9 @@ class SettingsDialog(Dialog):
     def __init__(self, app):
         super().__init__(app, "Options"); c = app.cfg
         self.section("listening")
-        self.v_mic = self.combo("RECORDING DEVICE", app.mic_names(), c["mic"] or DEFAULT_MIC, "the microphone Skynet Command listens to\n(also in the main window)", width=40)
+        self.v_mic = self.combo("RECORDING DEVICE", app.mic_names(), app.source_label(),
+                                "what Skynet Command listens to (also in the main window)\nSPEAKERS ▸ = what your PC plays: friends in Discord /\ngame voice chat can say commands (always on for them,\n"
+                                "only voice-like sound reaches the speech AI)\nMIC + SPEAKERS ▸ = you AND your friends\n★ ALL SOUND SOURCES = every microphone and every output at once", width=46)
         self.v_mode = self.combo("LISTEN MODE", ["always", "ptt"], c["mode"], "always = voice detection\nptt = only while the key is held")
         self.k_ptt = self.keyfield("PUSH-TO-TALK KEY", c["ptt_key"], "mouse buttons work too")
         self.k_tog = self.keyfield("LOCK / UNLOCK\nLISTENING KEY", c["toggle_key"], "press it anywhere (also in game)\nto stop / start listening")
@@ -2811,7 +3995,8 @@ class SettingsDialog(Dialog):
                                    "memory (GPU saver / normal):  large-v3-turbo ~0.9 / 1.6 GB · distil-small.en ~0.25 / 0.4 GB\n"
                                    "small.en ~0.3 / 0.5 GB · base.en ~0.1 / 0.15 GB  - smaller = lighter on the game", width=18)
         self.v_dev = self.combo("RUN ON", ["auto", "gpu", "cpu"], c["device"], "auto = NVIDIA GPU if its libraries are installed, else CPU", width=18)
-        self.v_lang = self.combo("LANGUAGE", list(LANGS), c["language"], "the language of your command phrases\nnot English = a multilingual model is used", width=18)
+        self.v_lang = self.combo("LANGUAGE", list(LANGS), "Deutsch (German)" if APP_LANG == "de" else c["language"],
+                                 "the language Whisper listens for\nnot English = a multilingual model is used\n(COMMAND LANGUAGE: deutsch always listens in German)", width=18)
         self.label("GPU BOOST", "NVIDIA cards: installs the CUDA libraries (~1 GB, one time)\nso the big accurate model runs on the graphics card -\nbetter recognition AND faster. Restart the app afterwards.")
         gb = tk.Frame(self.body, bg=self.cbg); gb.grid(row=self.row, column=self.c0 + 1, sticky="w", pady=2)
         IconButton(gb, "bolt", self.gpu_boost, "Install GPU boost", "opens the installer window (about 1 GB download)", fg=ORANGE, bg=self.cbg, size=28, sound="play").pack(side="left")
@@ -2821,6 +4006,15 @@ class SettingsDialog(Dialog):
         self.v_bias = self.check("TEACH WHISPER\nMY COMMANDS", c["bias"], "gives Whisper the command words as a hint")
         self.v_top = self.check("WINDOW ON TOP", c["ontop"], "keep Skynet Command above other windows")
         self.newcol()
+        self.section("look")
+        self.v_theme = self.combo("THEME", ["skynet", "nano", "blackwatch"], c.get("theme", "skynet"),
+                                  "SKYNET THEME = red machine HUD, TV static, Terminator-style sounds\n"
+                                  "NANO THEME = pale-mint suit HUD, hex armour cells, nanosuit-style sounds and voice\n"
+                                  "BLACKWATCH THEME = black + military yellow, tactical grid, radio-comms sounds and voice, military ranks\n"
+                                  "the app restarts by itself to switch")
+        self.v_alang = self.combo("COMMAND\nLANGUAGE", ["english", "deutsch"], "deutsch" if c.get("app_lang", "en") == "de" else "english",
+                                  "the language you SAY your commands in\nDEUTSCH = its own German profiles (Helldivers 2 in German),\n"
+                                  "German speech AI and German voice - your English profiles stay separate and untouched\nthe app restarts by itself to switch")
         self.section("macros")
         self.v_speed = self.scale("MACRO SPEED\n(ms per key)", 10, 200, c.get("key_ms", 60), 1,
                                   "time for each key press in EVERY macro\n15 = very fast · 60 = safe · 80+ = slow PCs\nif the game misses keys, raise it")
@@ -2834,8 +4028,10 @@ class SettingsDialog(Dialog):
         self.v_fail = self.combo("FAIL SOUND", ["off", "ptt only", "always"], c.get("fail_sound", "ptt only"),
                                  "a buzz when nothing matched or the game was not in front\nptt only = only with push-to-talk (talking to friends\nin 'always' mode would buzz a lot)", width=10)
         self.v_ptts = self.check("PUSH-TO-TALK SOUNDS", c.get("ptt_sounds", True), "radio click when you press / release the PTT key,\nlock / unlock sounds")
-        self.v_conf = self.check("SKYNET VOICE", c.get("confirm_voice", False), "a cold machine voice says the command name when it fires\n('Hellbomb') and 'listening online / offline'")
+        self.v_conf = self.check({"nano": "SUIT VOICE", "blackwatch": "RADIO VOICE"}.get(THEME, "SKYNET VOICE"), c.get("confirm_voice", False), "a cold machine voice says the command name when it fires\n('Hellbomb') and 'listening online / offline'")
         self.v_voice = self.check("SPOKEN REPLIES", c["voice"], "lets 'say ...' actions talk (Skynet voice)")
+        self.v_srate = self.combo("PRONUNCIATION\nSPEED", ["slow", "normal"], c.get("say_rate", "slow"),
+                                  "how fast ♪ reads a command aloud (speaker on each row / HEAR button)\nslow = easier to follow when learning the words")
         self.newcol()
         self.section("performance  ·  game fps")
         self.v_load = self.combo("AI LOAD", ["low", "balanced", "max"], c.get("ai_load", "balanced"),
@@ -2885,7 +4081,8 @@ class SettingsDialog(Dialog):
         super().destroy()
 
     def save(self):
-        mic = self.v_mic.get(); mic = "" if mic == DEFAULT_MIC else mic
+        src, mic, dev = App.parse_source(self.v_mic.get(), self.app.cfg["mic"])
+        dev = self.app.cfg.get("speaker_dev", "") if dev is None else dev
         if self.v_mode.get() == "ptt" and not self.k_ptt.get(): self.err.config(text="set a push-to-talk key first"); sfx("denied"); return
         new = dict(mic=mic, mode=self.v_mode.get(), ptt_key=self.k_ptt.get(), toggle_key=self.k_tog.get(),
                    model=self.v_model.get(), device=self.v_dev.get(), language=self.v_lang.get(), sensitivity=int(self.v_sens.get()),
@@ -2894,7 +4091,9 @@ class SettingsDialog(Dialog):
                    ontop=self.v_top.get(), key_ms=int(self.v_speed.get()), volume=int(self.v_vol.get()), ui_sounds=self.v_ui.get(),
                    fail_sound=self.v_fail.get(), ptt_sounds=self.v_ptts.get(), confirm_voice=self.v_conf.get(),
                    ai_load=self.v_load.get(), gpu_mem=self.v_gmem.get(), cpu_threads=int(self.v_thr_n.get()), game_first=self.v_first.get(),
-                   pause_anim=self.v_pause.get(), max_age=round(float(self.v_age.get()), 1))
+                   pause_anim=self.v_pause.get(), max_age=round(float(self.v_age.get()), 1), theme=self.v_theme.get(),
+                   app_lang="de" if self.v_alang.get() == "deutsch" else "en", say_rate=self.v_srate.get(),
+                   listen_src=src, speaker_dev=dev)
         app = self.app; super().destroy(); app.apply_settings(new)
 
 
@@ -2908,6 +4107,8 @@ class App:
             with open(SETTINGS_FILE, encoding="utf-8") as f: self.cfg.update(json.load(f))
         except Exception: pass
         if self.cfg.get("threshold") == 0.72: self.cfg["threshold"] = 0.78   # v1 default -> stricter v2 matcher
+        if self.cfg.pop("speakers", False) and self.cfg.get("listen_src", "mic") == "mic": self.cfg["listen_src"] = "both"   # v29 switch -> device list
+        if self.cfg.get("src_ver", 0) < 1: self.cfg["listen_src"], self.cfg["src_ver"] = "all", 1                        # v30: every sound source by default
         self.root = tk.Tk(); self.root.title("SKYNET COMMAND"); self.root.configure(bg=BG)
         self.icon = next((p for p in (os.path.join(HERE, "skynet_command.ico"), os.path.join(os.path.dirname(HERE), "Claude Captions", "skynet_alpha.ico")) if os.path.exists(p)), "")
         try: self.root.iconbitmap(default=self.icon)
@@ -2928,9 +4129,12 @@ class App:
         self.load_profiles()
         self.exec = Executor(self); self.exec.start()
         global SFX
-        set_priority(self.cfg.get("game_first", True))
+        set_priority(self.cfg.get("game_first", True)); self.stats = Stats()
         self.sfx = SFX = Sfx(self); self.build_ui(); self.make_frameless()
-        self.select_profile(self.cfg["profile"] if self.cfg["profile"] in self.profiles else next(iter(self.profiles)))
+        if getattr(self, "renamed_de", None): self.stats.move("Helldivers 2", HD2_NAME, set(self.renamed_de) - {c["name"] for c in hd2_commands()})
+        if getattr(self, "de_moved", None): self.stats.rename(HD2_NAME, self.de_moved)
+        want = self.cfg.get(PROF_KEY) or HD2_NAME
+        self.select_profile(want if want in self.profiles else HD2_NAME if HD2_NAME in self.profiles else next(iter(self.profiles)))
         self.start_capture()
         threading.Thread(target=self.recognize_loop, daemon=True).start()
         threading.Thread(target=self.hotkey_loop, daemon=True).start()
@@ -2951,9 +4155,15 @@ class App:
             try:
                 with open(os.path.join(PROFILE_DIR, f), encoding="utf-8") as fh: p = json.load(fh)
                 p.setdefault("commands", []); p.setdefault("name", f[:-5]); p.setdefault("process", "")
+                if APP_LANG == "de" and p["name"] == "Helldivers 2":         # old German profile shared the English name -> give it its own
+                    p["name"] = HD2_NAME; old = os.path.join(PROFILE_DIR, f); f = slug(HD2_NAME) + ".json"
+                    with open(os.path.join(PROFILE_DIR, f), "w", encoding="utf-8") as fh: json.dump(p, fh, ensure_ascii=False, indent=1)
+                    os.remove(old); self.renamed_de = [c.get("name") for c in p["commands"]]
                 self.profiles[p["name"]] = p; self.profile_files[p["name"]] = os.path.join(PROFILE_DIR, f)
                 if upgrade_hd2(p):
                     self.write_profile(p); self.upgraded = len(p["commands"])
+                moved = upgrade_hd2_de(p)
+                if moved is not None: self.write_profile(p); self.de_moved = moved
             except Exception as e:
                 traceback.print_exc(); print(f"bad profile {f}: {e}", file=sys.stderr)
         if not self.profiles:
@@ -2968,12 +4178,29 @@ class App:
     def save_profile(self):
         try: self.write_profile(self.profile)
         except Exception as e: self.log(f"could not save profile: {e}", "err")
-        self.matcher = Matcher(self.profile["commands"])
+        self.matcher = Matcher(self.profile["commands"]); self.build_alt()
+
+    def build_alt(self):
+        """friends may speak the OTHER language: the Helldivers stratagems in English (German mode) / German (English mode),
+        each pointing at YOUR command with the same stratagem code. Only used for what comes through the speakers."""
+        self.alt_matcher, self.alt_map = None, {}
+        try:
+            mine = {}
+            for i, c in enumerate(self.profile["commands"]):
+                acts = [a.strip().lower() for a in c.get("actions", []) if a.strip().lower().startswith("stratagem ")]
+                if c.get("enabled", True) and acts: mine.setdefault(acts[0], i)
+            if not mine: return
+            other = hd2_commands() if APP_LANG == "de" else hd2_commands_de()
+            other = [c for c in other if c.get("actions") and c["actions"][0].strip().lower() in mine]
+            self.alt_map = {k: mine[c["actions"][0].strip().lower()] for k, c in enumerate(other)}
+            self.alt_matcher = Matcher(other)
+        except Exception:
+            traceback.print_exc(); self.alt_matcher = None
 
     def select_profile(self, name, why=""):
         if name not in self.profiles: return
-        self.profile = self.profiles[name]; self.matcher = Matcher(self.profile["commands"])
-        self.prof_var.set(name); self.cfg["profile"] = name; self.fill_tree(); self.save_settings()
+        self.profile = self.profiles[name]; self.matcher = Matcher(self.profile["commands"]); self.build_alt()
+        self.prof_var.set(name); self.cfg[PROF_KEY] = name; self.fill_tree(); self.save_settings()
         n = len([c for c in self.profile["commands"] if c.get("enabled", True)])
         self.log(f"profile '{name}' · {n} commands" + (f" · {why}" if why else ""), "sys")
 
@@ -3040,7 +4267,9 @@ class App:
             says = " · ".join(c.get("phrases", [])); does = "   ".join(pretty_action(a) for a in c.get("actions", []) if not a.startswith("#")) or "— not set —"
             if q and q not in (c.get("name", "") + " " + says + " " + c.get("category", "")).lower(): continue
             rows.append((i, (c.get("name", ""), says, does, c.get("category", "")), c.get("enabled", True),
-                         {"name": c.get("name", ""), "phrases": c.get("phrases", []), "actions": c.get("actions", []), "code": stratagem_code(c.get("actions", []))}))
+                         {"name": c.get("name", ""), "phrases": c.get("phrases", []), "actions": c.get("actions", []), "code": stratagem_code(c.get("actions", [])),
+                          "count": self.stats.count(self.profile["name"], c.get("name", ""))}))
+            code = rows[-1][3]["code"]; rows[-1][3]["icon"] = "".join(code) if code else None
         self.tree.set_rows(rows)
         self.count_lbl.config(text=f"{len(self.profile['commands'])} commands")
 
@@ -3083,8 +4312,28 @@ class App:
 
     # ---------------- speech ----------------
     def start_capture(self):
+        """RECORDING DEVICE: a microphone, SPEAKERS ▸ an output (what the PC plays: friends on Discord ...), or MIC + SPEAKERS ▸ both"""
         if self.capture: self.capture.running = False
+        for cp in getattr(self, "extra_caps", []): cp.running = False
+        self.extra_caps = []; src = self.cfg.get("listen_src", "mic")
+        if src == "spk":
+            self.capture = SpeakerCapture(self, self.cfg.get("speaker_dev", "")); self.capture.start()
+            return
         self.capture = Capture(self, self.cfg["mic"]); self.capture.start()
+        if src == "both": self.extra_caps = [SpeakerCapture(self, self.cfg.get("speaker_dev", ""))]
+        elif src == "all":                                     # every microphone and every output at once
+            try: mics = list_mics()
+            except Exception: mics = []
+            try: spks = [d["name"] for d in list_speakers()]
+            except Exception: spks = []
+            main = self.cfg["mic"] or next((m["name"] for m in mics if m.get("default")), "")
+            self.extra_caps = ([Capture(self, m["name"], extra=True) for m in mics if m["name"] != main]
+                               + [SpeakerCapture(self, d, extra=True) for d in spks])
+        for cp in self.extra_caps: cp.start()
+
+    def speech_lang(self):
+        """the language Whisper listens for: German in the Deutsch app language, otherwise OPTIONS → LANGUAGE"""
+        return "de" if APP_LANG == "de" else LANGS.get(self.cfg["language"], "en")
 
     def want_key(self):
         return (self.cfg["model"], self.cfg["device"], self.cfg["language"], self.cfg.get("gpu_mem", "saver"), self.threads())
@@ -3094,7 +4343,7 @@ class App:
 
     def load_model(self):
         from faster_whisper import WhisperModel
-        model, dev, lang = self.want_key()[:3]; code = LANGS.get(lang, "en")
+        model, dev, lang = self.want_key()[:3]; code = self.speech_lang()
         try:
             import ctranslate2; gpus = ctranslate2.get_cuda_device_count()
         except Exception: gpus = 0
@@ -3112,7 +4361,9 @@ class App:
         last = None
         for d, ct, name in tries:
             self.model = None; import gc; gc.collect()          # free the old model's memory first
-            if code != "en" and name.endswith(".en"): name = name[:-3]
+            if code != "en":                                 # English-only models -> their multilingual twin
+                name = {"distil-small.en": "small", "distil-medium.en": "medium", "distil-large-v3": "large-v3-turbo"}.get(name, name)
+                if name.endswith(".en"): name = name[:-3]
             self.loading = True; self.log(f"loading Whisper '{name}' on {d.upper()} (first time downloads it)...", "sys")
             try:
                 m = WhisperModel(name, device=d, compute_type=ct, cpu_threads=self.threads(), num_workers=1)
@@ -3141,14 +4392,31 @@ class App:
                 if self.model_key != self.want_key():
                     self.model_key = self.want_key(); self.model = None
                     if self.load_model(): self.zap_at = time.time()      # online: electric burst in the header
-                try: t_end, audio = self.utt_q.get(timeout=0.3)
+                try: item = self.utt_q.get(timeout=0.3)
                 except queue.Empty: continue
+                item = self.next_item(item)
+                if item is None: continue
+                t_end, audio = item[0], item[1]; self.src = item[2] if len(item) > 2 else "mic"
                 if self.model is None or t_end <= self.flush_until: continue
-                if time.time() - t_end > float(self.cfg.get("max_age", 3.0)):
+                age_ok = float(self.cfg.get("max_age", 3.0)) if len(item) < 3 or item[2] != "spk" else max(3.0, float(self.cfg.get("max_age", 3.0)))
+                if time.time() - t_end > age_ok:
                     self.log(f"dropped a command said {time.time() - t_end:.1f} s ago (too late)", "miss"); continue
                 self.handle(audio, t_end)
             except Exception as e:
                 traceback.print_exc(); self.log(f"speech error: {e}", "err"); time.sleep(0.5)
+
+    def next_item(self, item):
+        """what to recognise next: YOUR voice first; from the speakers only the newest short phrase.
+        Friends chatting / videos / game dialogue would otherwise queue up in front of a real command and make it late."""
+        items = [item]
+        while True:
+            try: items.append(self.utt_q.get_nowait())
+            except queue.Empty: break
+        mine = [x for x in items if len(x) < 3 or x[2] != "spk"]
+        spk = [x for x in items if len(x) > 2 and x[2] == "spk" and len(x[1]) <= SR * 3.5]   # commands are short; long talk is chatter
+        keep = mine[1:] + spk[-1:] if mine else []
+        for x in keep: self.utt_q.put(x)                                    # back in line (mine first, newest speaker phrase last)
+        return mine[0] if mine else (spk[-1] if spk else None)
 
     @staticmethod
     def clean_audio(audio):
@@ -3161,10 +4429,11 @@ class App:
         pad = np.zeros(int(SR * 0.25), dtype=np.float32)
         return np.concatenate([pad, a, pad])
 
-    def transcribe(self, audio, focus=None):
-        """focus = a few candidate commands: second, narrower pass that only 'expects' those words"""
+    def transcribe(self, audio, focus=None, auto_lang=False):
+        """focus = a few candidate commands: second, narrower pass that only 'expects' those words
+        auto_lang = friends through the speakers: Whisper works out which language they speak"""
         audio = self.clean_audio(audio)
-        code = LANGS.get(self.cfg["language"], "en")
+        code = self.speech_lang()          # friends are heard in your command language too (short phrases mis-detect the language too often)
         if focus:
             words = list(dict.fromkeys(ph for c in focus for ph in c.get("phrases", [])[:2]))
             prompt = "Voice commands: " + ", ".join(words) + "."; hot = " ".join(words)
@@ -3189,19 +4458,23 @@ class App:
         if f == "always" or (f == "ptt only" and self.cfg["mode"] == "ptt"): self.play("miss", "cmd")
 
     def handle(self, audio, t_end):
-        t = time.time(); text = self.transcribe(audio); self.latency = time.time() - t_end
+        spk = getattr(self, "src", "mic") == "spk"
+        t = time.time(); text = self.transcribe(audio, auto_lang=spk); self.latency = time.time() - t_end
         self.t_wait, self.t_ai = t - t_end, time.time() - t           # waiting in line / Whisper itself
         if not re.search(r"\w", text) or " ".join(normalize(text)) in JUNK:
-            if self.cfg["mode"] == "ptt": self.fail_sound()
+            if self.cfg["mode"] == "ptt" and not spk: self.fail_sound()
             return
         ranked = self.matcher.match(text); thr = float(self.cfg["threshold"]); prof = self.profile; second = ""
         if ranked and thr > ranked[0][1] >= 0.45 and self.cfg.get("ai_load", "balanced") != "low":
             # near miss -> second, focused pass: Whisper listens again expecting only the 5 closest commands
             cands = [i for i, _ in ranked[:5]]
-            t2 = self.transcribe(audio, focus=[prof["commands"][i] for i in cands])
+            t2 = self.transcribe(audio, focus=[prof["commands"][i] for i in cands], auto_lang=spk)
             r2 = self.matcher.match(t2) if t2 else []
             if r2 and r2[0][1] >= thr and r2[0][0] in cands: ranked, second = r2, f"  (2nd pass: “{t2}”)"
             self.latency = time.time() - t_end
+        if spk and (not ranked or ranked[0][1] < thr) and getattr(self, "alt_matcher", None):
+            ra = self.alt_matcher.match(text)                  # a friend said it in the other language
+            if ra and ra[0][1] >= thr and ra[0][0] in self.alt_map: ranked = [(self.alt_map[ra[0][0]], ra[0][1])]
         if not ranked or ranked[0][1] < thr:
             if ranked and ranked[0][1] >= 0.4:
                 near = prof["commands"][ranked[0][0]]["name"]
@@ -3209,7 +4482,9 @@ class App:
             else:
                 link = ("new", text); hint = "  · click to make it a command"
             self.ui_q.put(("heard", text, None, ranked[0][1] if ranked else 0))
-            self.log(f"“{text}” → no match{hint}", "miss", link); self.fail_sound(); return
+            if spk:                                          # friends talking normally: quiet grey line, no buzz, combo kept
+                self.log(f"◂ speakers: “{text}” → no match" + (f" (closest: {prof['commands'][ranked[0][0]]['name']} {ranked[0][1] * 100:.0f}%)" if ranked else ""), "dim", link); return
+            self.log(f"“{text}” → no match{hint}", "miss", link); self.fail_sound(); self.ui_q.put(("combo_miss",)); return
         i, score = ranked[0]; cmd = prof["commands"][i]; link = ("cmd", prof["name"], cmd["name"])
         need = (prof.get("process") or "").lower()
         if not need and prof.get("auto_detect", True):           # learn the game by itself: the full-screen program you talk to
@@ -3217,17 +4492,62 @@ class App:
             if exe and full and exe not in IGNORE_EXE: self.ui_q.put(("learn", prof["name"], exe))
         if self.cfg["focus_only"] and need and self.fg_exe != need:
             self.ui_q.put(("heard", text, cmd["name"] + " (game not in front)", score))
-            self.log(f"“{text}” → {cmd['name']} — ignored, {need} is not in front", "miss", link); self.fail_sound(); return
+            self.log(f"“{text}” → {cmd['name']} — ignored, {need} is not in front", "miss", link); self.fail_sound(); self.ui_q.put(("combo_miss",)); return
         late = time.time() - t_end
-        if t_end <= self.flush_until or late > float(self.cfg.get("max_age", 3.0)) + 1.0:     # refreshed meanwhile / way too late
+        if t_end <= self.flush_until or late > (max(3.0, float(self.cfg.get("max_age", 3.0))) if spk else float(self.cfg.get("max_age", 3.0))) + 1.0:     # refreshed meanwhile / way too late
             self.log(f"“{text}” → {cmd['name']} — dropped, said {late:.1f} s ago", "miss", link); return
+        last = getattr(self, "last_fired", ("", 0.0, ""))
+        if getattr(self, "extra_caps", None) and last[0] == cmd["name"] and time.time() - last[1] < 2.0:   # same words heard by 2 devices
+            self.ui_q.put(("heard", text, None, score)); return
+        if spk and last[0] == cmd["name"] and len(last) > 2 and last[2] == "mic" and time.time() - last[1] < 12:   # the game's own callout ("Reinforcing!") echoing a command YOU just used
+            self.log(f"◂ speakers: “{text}” → {cmd['name']} — skipped, you just used it (game call-out?)", "dim", link)
+            self.ui_q.put(("heard", text, None, score)); return
+        self.last_fired = (cmd["name"], time.time(), "spk" if spk else "mic")
         self.exec.submit(cmd, prof); self.fired_at = time.time()
+        cnt, _, lv = self.stats.hit(prof["name"], cmd["name"]); self.ui_q.put(("stat", i, cnt, lv))
         self.ui_q.put(("heard", text, cmd["name"], score))
         keys = self.macro_time(cmd, prof)
         self.log(f"“{text}” → {cmd['name']}   {score * 100:.0f}% · {self.latency * 1000:.0f} ms to fire (AI {self.t_ai * 1000:.0f} ms"
-                 + (f", waited {self.t_wait * 1000:.0f} ms" if self.t_wait > 0.05 else "") + f") + keys {keys * 1000:.0f} ms{second}", "ok", link)
+                 + (f", waited {self.t_wait * 1000:.0f} ms" if self.t_wait > 0.05 else "") + f") + keys {keys * 1000:.0f} ms{second}" + ("  · via speakers" if spk else ""), "ok", link)
         self.play("ok", "cmd")
-        if self.cfg.get("confirm_voice"): self.speak(spoken_name(cmd["name"]), confirm=True, delay=0.2)
+        if self.cfg.get("confirm_voice"): self.speak(self.confirm_line(cmd["name"]), confirm=True, delay=0.2)
+
+    def pronounce(self, i=None):
+        """read a command aloud in a natural voice: its name, then the phrases you can say (for learning how to say them)"""
+        i = self.selected() if i is None else i
+        if i is None or not WIN: return
+        c = self.profile["commands"][i]; name = spoken_name(c.get("name", ""))
+        seen, parts = set(), []
+        for x in [c.get("name", "")] + c.get("phrases", []):
+            code, rest = split_code(x.strip()); x = rest or x                                  # 'TD-220 Bastion' -> 'Bastion'
+            if re.fullmatch(r"[A-Z]{1,6}(/[A-Z]{1,6})?-?[A-Z0-9]*\d[A-Z0-9]*", x.strip()): continue   # a code name alone (TD-220, A/MG-43) is skipped
+            k = " ".join(normalize(x))
+            if not k or k in seen: continue
+            seen.add(k); parts.append(x)
+            if len(parts) >= 4: break
+        if self.voice is None: self.voice = Voice(self)
+        self.voice.pronounce(". ".join(parts) + ".", {"slow": -4, "normal": 0}.get(self.cfg.get("say_rate", "slow"), -4))
+        self.log(f"♪ {' · '.join(parts)}", "dim")
+        if not getattr(self, "voices_checked", False): self.voices_checked = True; threading.Thread(target=self.check_voice, daemon=True).start()
+
+    def check_voice(self):
+        """is a Windows voice for this language installed? (German needs the German speech pack)"""
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", "Add-Type -AssemblyName System.Speech; "
+                                  "(New-Object System.Speech.Synthesis.SpeechSynthesizer).GetInstalledVoices() | % { $_.VoiceInfo.Culture.Name }"],
+                                 capture_output=True, text=True, timeout=20, creationflags=0x08000000).stdout
+            if not any(l.strip().lower().startswith(APP_LANG) for l in out.splitlines()):
+                self.log("no German Windows voice installed - it is read with an English voice. Install one: Windows Settings → Time & language → "
+                         "Speech → Manage voices → Add voices → Deutsch, then restart the app." if APP_LANG == "de" else
+                         "no English Windows voice installed - Windows Settings → Time & language → Speech → Add voices", "sys")
+        except Exception: pass
+
+    @staticmethod
+    def confirm_line(name):
+        """what the voice says when a command fires (blackwatch: radio style 'Copy. Hellbomb.')"""
+        nm = spoken_name(name)
+        if THEME == "blackwatch": return f"Verstanden. {nm}." if APP_LANG == "de" else f"Copy. {nm}."
+        return nm
 
     def macro_time(self, cmd, prof):
         """how long the key presses of a macro take at the current MACRO SPEED"""
@@ -3245,7 +4565,7 @@ class App:
         if self.voice is None:
             self.voice = Voice(self)
             if self.cfg.get("confirm_voice") and self.profile:      # pre-make every command name in the background
-                self.voice.warm([spoken_name(c["name"]) for c in self.profile["commands"] if c.get("enabled", True)])
+                self.voice.warm([self.confirm_line(c["name"]) for c in self.profile["commands"] if c.get("enabled", True)])
         self.voice.say(text, delay)
 
     # ---------------- hotkeys + game focus ----------------
@@ -3289,7 +4609,8 @@ class App:
             try: self.utt_q.get_nowait()
             except queue.Empty: break
         self.exec.abort()
-        if self.capture: self.capture.reset(); self.capture.ptt_rec = None
+        for cp in [self.capture] + list(getattr(self, "extra_caps", [])):
+            if cp: cp.reset(); cp.ptt_rec = None
         self.log(f"⟳ refreshed - {n} waiting command{'s' if n != 1 else ''} dropped, nothing old will fire", "sys")
 
     def on_foreground(self, exe):
@@ -3303,8 +4624,8 @@ class App:
         st = ttk.Style(); st.theme_use("clam")
         st.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=WHITE, rowheight=26, bordercolor=GRID, borderwidth=0, font=(MONO, 10))
         st.configure("Treeview.Heading", background=BG, foreground=RED, font=(MONO, 9, "bold"), bordercolor=GRID, relief="flat")
-        st.map("Treeview", background=[("selected", "#3A0E0E")], foreground=[("selected", WHITE)])
-        st.map("Treeview.Heading", background=[("active", "#1C0909")])
+        st.map("Treeview", background=[("selected", T("#3A0E0E"))], foreground=[("selected", WHITE)])
+        st.map("Treeview.Heading", background=[("active", T("#1C0909"))])
         st.configure("TCombobox", fieldbackground=PANEL, background=GRID, foreground=WHITE, arrowcolor=RED, bordercolor=RED_DIM,
                      lightcolor=PANEL, darkcolor=PANEL, selectbackground=PANEL, selectforeground=WHITE)
         st.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", WHITE)])
@@ -3331,7 +4652,7 @@ class App:
         hbtn(bar, "⚙ OPTIONS", lambda: SettingsDialog(self), bg=BG, tip="Recording device, push-to-talk, lock key, macro speed, speech AI").pack(side="right")
         bar2 = tk.Frame(r, bg=BG); bar2.pack(fill="x", padx=12, pady=(2, 4))
         IconButton(bar2, "mic", lambda: self.mic_box.event_generate("<Button-1>"), "Recording device", "the microphone Skynet Command listens to\nthe bar in the header shows its level", fg=GREEN, bg=BG).pack(side="left", padx=(0, 4))
-        self.mic_var = tk.StringVar(value=self.cfg["mic"] or DEFAULT_MIC)
+        self.mic_var = tk.StringVar(value=self.source_label())
         self.mic_box = ttk.Combobox(bar2, textvariable=self.mic_var, values=[self.mic_var.get()], state="readonly", width=48, font=(MONO, 10),
                                     postcommand=lambda: self.mic_box.config(values=self.mic_names()))
         self.mic_box.pack(side="left", ipady=2); self.mic_box.bind("<<ComboboxSelected>>", lambda e: self.change_mic(self.mic_var.get()))
@@ -3357,9 +4678,10 @@ class App:
         self.count_lbl = tk.Label(top, text="", bg=BG, fg=DIM, font=(MONO, 9)); self.count_lbl.pack(side="left")
         btns = tk.Frame(left, bg=BG); btns.pack(side="bottom", fill="x", pady=(6, 0))
         for txt, cmd, fg in (("＋ ADD", self.add_command, ORANGE), ("✎ EDIT", self.edit_command, RED), ("⧉ COPY", self.dup_command, RED),
-                             ("▶ TEST", self.test_selected, RED), ("✖ DELETE", self.del_command, DIM)):
+                             ("▶ TEST", self.test_selected, RED), ("♪ HEAR", self.pronounce, ORANGE), ("✖ DELETE", self.del_command, DIM)):
             hbtn(btns, txt, cmd, fg=fg, bold=txt.startswith("＋"), bg=BG).pack(side="left", padx=(0, 6))
         self.tree = HudList(left, [("COMMAND", 3), ("WHEN I SAY", 3.4), ("DO THIS", 3.2), ("GROUP", 1.2)], self.edit_command, self.del_command)
+        self.tree.icon_for = self.icon_for
         self.tree.pack(fill="both", expand=True)
         Tip(self.tree.head, "Commands\nclick = select · double-click / Enter = edit · Delete = remove\nscroll with the wheel or the bar on the right")
         lh = tk.Frame(right, bg=BG); lh.pack(fill="x", pady=(0, 4))
@@ -3368,15 +4690,61 @@ class App:
         IconButton(lh, "undo", self.flush_commands, "Refresh - drop waiting commands",
                    "forgets everything you said that has not fired yet\nand stops a macro that is running -\nnothing old will be pushed into the game", fg=ORANGE, bg=BG, size=28, sound="cancel").pack(side="right")
         tk.Label(lh, text="click ▸ lines to edit", bg=BG, fg=RED_DIM, font=(MONO, 8)).pack(side="right", padx=6)
+        self.combo = ComboPanel(right, self); self.combo.pack(fill="x", pady=(0, 4))
+        self.rank_side = RankSide(self)
         self.logv = LogView(right, self.open_link); self.logv.pack(fill="both", expand=True)
         self.update_listen_btn()
 
+    def icon_for(self, code, size=26):
+        """the stratagem icon for an arrow code (from icons/hd2), or None - loaded once and kept"""
+        if not code: return None
+        cache = self.__dict__.setdefault("_icons", {}); k = (code, size)
+        if k not in cache:
+            cache[k] = None
+            try:
+                if "map" not in cache:
+                    with open(os.path.join(ICON_DIR, "icons.json"), encoding="utf-8") as f: cache["map"] = json.load(f)
+                m = cache["map"]; i = m["icons"].get(code)
+                if i is not None:
+                    sk = ("sheet", size)
+                    if sk not in cache: cache[sk] = tk.PhotoImage(file=os.path.join(ICON_DIR, f"sheet_{size}.png"))
+                    x, y = (i % m["cols"]) * size, (i // m["cols"]) * size
+                    img = tk.PhotoImage(width=size, height=size)
+                    img.tk.call(img, "copy", cache[sk], "-from", x, y, x + size, y + size, "-to", 0, 0)   # cut this icon out of the sheet
+                    cache[k] = img
+            except (OSError, ValueError, KeyError, tk.TclError): cache["map"] = {"cols": 1, "icons": {}}
+        return cache[k]
+
+    def speaker_names(self):
+        try: return [DEFAULT_SPK] + [d["name"] for d in list_speakers()]
+        except Exception: return [DEFAULT_SPK]
+
     def mic_names(self):
-        try: return [DEFAULT_MIC] + [m["name"] for m in list_mics()]
-        except Exception: return [DEFAULT_MIC]
+        """RECORDING DEVICE list: microphones, then every output as SPEAKERS ▸ ... and MIC + SPEAKERS ▸ ..."""
+        try: mics = [m["name"] for m in list_mics()]
+        except Exception: mics = []
+        spk = self.speaker_names()
+        return [ALL_SRC, DEFAULT_MIC] + mics + [SPK_PRE + n for n in spk] + [BOTH_PRE + n for n in spk]
+
+    def source_label(self):
+        src, dev = self.cfg.get("listen_src", "mic"), self.cfg.get("speaker_dev") or DEFAULT_SPK
+        if src == "all": return ALL_SRC
+        return SPK_PRE + dev if src == "spk" else BOTH_PRE + dev if src == "both" else (self.cfg["mic"] or DEFAULT_MIC)
+
+    @staticmethod
+    def parse_source(name, mic):
+        """dropdown text -> (listen_src, mic, speaker_dev); MIC + SPEAKERS / ALL keep the microphone you had"""
+        if name == ALL_SRC: return "all", mic, None
+        for pre, src in ((BOTH_PRE, "both"), (SPK_PRE, "spk")):
+            if name.startswith(pre):
+                dev = name[len(pre):]; return src, mic, "" if dev == DEFAULT_SPK else dev
+        return "mic", "" if name == DEFAULT_MIC else name, None
 
     def change_mic(self, name):
-        self.cfg["mic"] = "" if name == DEFAULT_MIC else name; self.save_settings(); self.start_capture()
+        src, mic, dev = self.parse_source(name, self.cfg["mic"])
+        self.cfg["listen_src"], self.cfg["mic"] = src, mic
+        if dev is not None: self.cfg["speaker_dev"] = dev
+        self.save_settings(); self.start_capture()
 
     def autogame_on(self):
         """auto-detect game: one switch, shown by the Skynet eye (open = watching for the game), the AUTO chip,
@@ -3400,7 +4768,7 @@ class App:
             p["auto_detect"] = on
             try: self.write_profile(p)
             except Exception: pass
-        self.save_settings(); self.update_info(); self.play("unlocked" if on else "locked")
+        self.save_settings(); self.update_info(); self.play("eye_open" if on else "eye_close")
         self.log("auto-detect game ON - profiles follow the game you open" if on else "auto-detect game OFF - profiles stay as you pick them", "sys")
         if on and self.fg_exe: self.on_foreground(self.fg_exe)
 
@@ -3439,7 +4807,7 @@ class App:
         for name, (x0, y0, x1, y1) in boxes.items():
             hov = getattr(self, "win_hover", None) == name
             col = (WHITE if name == "close" else ORANGE) if hov else RED
-            fill = ("#8A1010" if name == "close" else "#2A0C0C") if hov else BG
+            fill = (T("#8A1010") if name == "close" else T("#2A0C0C")) if hov else BG
             c.create_polygon(x0, y0, x1 - 5, y0, x1, y0 + 5, x1, y1, x0 + 5, y1, x0, y1 - 5, fill=fill, outline=col if hov else RED_DIM)
             cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
             if name == "min": c.create_line(cx - 6, cy + 4, cx + 6, cy + 4, fill=col, width=2)
@@ -3515,7 +4883,7 @@ class App:
         self.draw_credit(c, 67, 42, t)
         bx = self.draw_win_buttons(c, w) - 12
         self.draw_status(c, bx, t)
-        lv = self.capture.level if self.capture else 0.0; lvl = min(1.0, math.sqrt(lv) * 2.4)
+        lv = max([cp.level for cp in [self.capture] + list(getattr(self, "extra_caps", [])) if cp] or [0.0]); lvl = min(1.0, math.sqrt(lv) * 2.4)
         x0, x1, y = 66, w - 20, 72; n = 60; seg = (x1 - x0) / n
         for k in range(n):
             lit = k < lvl * n
@@ -3524,26 +4892,26 @@ class App:
         if self.capture and self.capture.err: c.create_text(w / 2, y, text="MIC: " + self.capture.err[:60], fill=RED, font=(MONO, 9, "bold"))
         self.root.after(400 if PAUSED[0] else 50, self.animate)     # in game: ~2 frames a second
 
-    CREDIT = "MADE BY SALUTEM"
+    CREDIT = "GEMACHT VON SALUTEM" if APP_LANG == "de" else "MADE BY SALUTEM"
     STEAM_URL = "https://steamcommunity.com/id/hecton/"
     DISCORD = "hekton"
 
     def draw_credit(self, c, x, y, t):
         """'MADE BY SALUTEM': a light sweeps over the letters, now and then a letter glitches; hover = brighter + underline, click = contact card"""
         if not hasattr(self, "credit_cw"): self.credit_cw = tkfont.Font(family=MONO, size=8, weight="bold").measure("M")
-        txt, cw, hov = self.CREDIT, self.credit_cw, getattr(self, "credit_hover", False)
+        txt, cw, hov = self.CREDIT, self.credit_cw, getattr(self, "credit_hover", False); name_at = txt.index("SALUTEM")
         sweep = (t * 9) % (len(txt) + 14) - 4                       # position of the running light
         glitch = random.randrange(len(txt)) if random.random() < 0.04 else -1
         for k, ch in enumerate(txt):
             if ch == " ": continue
             g = max(0.0, 1 - abs(k - sweep) / 2.5)
-            base = lerp(RED_DIM, RED, 0.55 + 0.25 * math.sin(t * 2 + k * 0.4)) if k >= 8 else lerp(DIM, "#9AA0AD", 0.3)   # SALUTEM in red
+            base = lerp(RED_DIM, RED, 0.55 + 0.25 * math.sin(t * 2 + k * 0.4)) if k >= name_at else lerp(DIM, T("#9AA0AD"), 0.3)   # SALUTEM in red
             col = lerp(base, WHITE if hov else ORANGE, max(g, 0.55 if hov else 0.0))
             show = random.choice("01#%@$&") if k == glitch else ch
             c.create_text(x + k * cw, y + (random.choice((-1, 1)) if k == glitch else 0), text=show, fill=col, font=(MONO, 8, "bold"), anchor="w")
         w = len(txt) * cw; self.credit_box = (x - 2, y - 8, x + w + 2, y + 8)
         if hov: c.create_line(x, y + 8, x + w, y + 8, fill=ORANGE)
-        else: c.create_line(x + 8 * cw, y + 8, x + 8 * cw + (w - 8 * cw) * (0.5 + 0.5 * math.sin(t * 1.5)), y + 8, fill=RED_DIM)
+        else: c.create_line(x + name_at * cw, y + 8, x + name_at * cw + (w - name_at * cw) * (0.5 + 0.5 * math.sin(t * 1.5)), y + 8, fill=RED_DIM)
 
     def on_credit(self, e):
         b = getattr(self, "credit_box", None)
@@ -3558,15 +4926,15 @@ class App:
             self.credit_card = None; return
         sfx("open")
         w = self.credit_card = tk.Toplevel(self.root); w.overrideredirect(True); w.attributes("-topmost", True); w.configure(bg=RED)
-        box = tk.Frame(w, bg="#101218"); box.pack(padx=1, pady=1)
-        tk.Label(box, text="◢ SALUTEM", bg="#101218", fg=ORANGE, font=(MONO, 10, "bold"), anchor="w").pack(fill="x", padx=12, pady=(8, 4))
+        box = tk.Frame(w, bg=T("#101218")); box.pack(padx=1, pady=1)
+        tk.Label(box, text="◢ SALUTEM", bg=T("#101218"), fg=ORANGE, font=(MONO, 10, "bold"), anchor="w").pack(fill="x", padx=12, pady=(8, 4))
         def row(icon, label, value, action, tip):
-            f = tk.Frame(box, bg="#101218", cursor="hand2"); f.pack(fill="x", padx=8, pady=2)
-            ic = tk.Canvas(f, width=24, height=24, bg="#101218", highlightthickness=0); ic.pack(side="left")
+            f = tk.Frame(box, bg=T("#101218"), cursor="hand2"); f.pack(fill="x", padx=8, pady=2)
+            ic = tk.Canvas(f, width=24, height=24, bg=T("#101218"), highlightthickness=0); ic.pack(side="left")
             draw_icon(ic, icon, 1, 1, 22, RED)
-            lb = tk.Label(f, text=f"{label}  ", bg="#101218", fg=DIM, font=(MONO, 9, "bold")); lb.pack(side="left")
-            val = tk.Label(f, text=value, bg="#101218", fg=WHITE, font=(MONO, 9, "underline"), cursor="hand2"); val.pack(side="left")
-            hint = tk.Label(f, text=tip, bg="#101218", fg=RED_DIM, font=(MONO, 8)); hint.pack(side="left", padx=(8, 4))
+            lb = tk.Label(f, text=f"{label}  ", bg=T("#101218"), fg=DIM, font=(MONO, 9, "bold")); lb.pack(side="left")
+            val = tk.Label(f, text=value, bg=T("#101218"), fg=WHITE, font=(MONO, 9, "underline"), cursor="hand2"); val.pack(side="left")
+            hint = tk.Label(f, text=tip, bg=T("#101218"), fg=RED_DIM, font=(MONO, 8)); hint.pack(side="left", padx=(8, 4))
             for wd in (f, ic, lb, val, hint):
                 wd.bind("<Enter>", lambda e: val.config(fg=ORANGE)); wd.bind("<Leave>", lambda e: val.config(fg=WHITE))
                 wd.bind("<Button-1>", lambda e: action(hint))
@@ -3579,9 +4947,9 @@ class App:
         row("gamepad", "STEAM  ", "steamcommunity.com/id/hecton", steam, "click to open")
         row("listen", "DISCORD", self.DISCORD, discord, "click to copy")
         tk.Frame(box, bg=RED_DIM, height=1).pack(fill="x", padx=10, pady=(8, 4))
-        tk.Label(box, text="⚠ THIS APP IS FREE - IT CANNOT BE SOLD", bg="#101218", fg=RED, font=(MONO, 9, "bold"), anchor="w").pack(fill="x", padx=12)
-        tk.Label(box, text="if you paid for it, you were scammed", bg="#101218", fg=DIM, font=(MONO, 8), anchor="w").pack(fill="x", padx=12)
-        lic = tk.Label(box, text="license: PolyForm Noncommercial 1.0.0  (LICENSE.txt)", bg="#101218", fg=RED_DIM, font=(MONO, 8, "underline"),
+        tk.Label(box, text="⚠ THIS APP IS FREE - IT CANNOT BE SOLD", bg=T("#101218"), fg=RED, font=(MONO, 9, "bold"), anchor="w").pack(fill="x", padx=12)
+        tk.Label(box, text="if you paid for it, you were scammed", bg=T("#101218"), fg=DIM, font=(MONO, 8), anchor="w").pack(fill="x", padx=12)
+        lic = tk.Label(box, text="license: PolyForm Noncommercial 1.0.0  (LICENSE.txt)", bg=T("#101218"), fg=RED_DIM, font=(MONO, 8, "underline"),
                        anchor="w", cursor="hand2")
         lic.pack(fill="x", padx=12, pady=(2, 8))
         lic.bind("<Button-1>", lambda e: os.path.exists(os.path.join(HERE, "LICENSE.txt")) and os.startfile(os.path.join(HERE, "LICENSE.txt")) if WIN else None)
@@ -3627,10 +4995,10 @@ class App:
         for k, (icon, col, label, tip) in reversed(list(enumerate(self.status_glyphs(t)))):
             wdt = 60; x0 = x - wdt
             hov = getattr(self, "glyph_hover", None) == tip
-            c.create_polygon(x0, 6, x - 7, 6, x - 1, 12, x - 1, 54, x0 + 6, 54, x0, 48, fill="#1C0909" if hov else "#0B0C10",
+            c.create_polygon(x0, 6, x - 7, 6, x - 1, 12, x - 1, 54, x0 + 6, 54, x0, 48, fill=T("#1C0909") if hov else T("#0B0C10"),
                              outline=lerp(RED_DIM, col, 0.6 if hov else 0.35))
             draw_icon(c, icon, x0 + wdt / 2 - 13, 9, 26, col, t)
-            c.create_text(x0 + wdt / 2, 46, text=label, fill=col if col != DIM else "#8A8F9C", font=(MONO, 7, "bold"))
+            c.create_text(x0 + wdt / 2, 46, text=label, fill=col if col != DIM else T("#8A8F9C"), font=(MONO, 7, "bold"))
             self.glyph_boxes.append((x0, 6, x, 54, tip))
             if k == 0: self.ai_box = (x0, 6, x, 54)
             x = x0 - 6
@@ -3655,67 +5023,63 @@ class App:
             c.create_oval(px - 2, pts[-1] - 2, px + 2, pts[-1] + 2, fill=lerp(BG, WHITE, k), outline="")
 
     def draw_logo(self, c, cx, cy, r, t, on):
-        """the Skynet eye: a machine eye in a rotating ring that always looks at the mouse pointer (anywhere on screen),
-        blinks with metal shutters now and then, glows orange when a command fires and half-closes when listening is locked"""
+        """the Skynet eye = the app logo come alive: a hex core with 6 armoured lids (an aperture) that open and close,
+        the core looks at the mouse pointer (anywhere on screen), the lids blink now and then, glow orange when a command fires,
+        half-close when listening is locked and shut when auto-detect game is off"""
         now = time.time(); strike = max(0.0, 1.0 - (now - getattr(self, "fired_at", 0.0)) / 0.6)
         # --- where to look
         try:
             px, py = c.winfo_pointerxy(); gx, gy = c.winfo_rootx() + cx, c.winfo_rooty() + cy
             dx, dy = px - gx, py - gy; d = math.hypot(dx, dy) or 1.0
-            k = min(1.0, d / 260) * r * 0.3; tx, ty = dx / d * k, dy / d * k
+            k = min(1.0, d / 260) * r * 0.17; tx, ty = dx / d * k, dy / d * k
         except tk.TclError:
             tx = ty = 0.0
         watch = self.autogame_on()
         if not watch: tx = ty = 0.0                     # closed eye looks nowhere
         ox, oy = getattr(self, "eye_off", (0.0, 0.0)); ox += (tx - ox) * 0.4; oy += (ty - oy) * 0.4; self.eye_off = (ox, oy)
-        # --- blink (shutters) every 3-8 s
-        if now > getattr(self, "blink_at", 0.0) + 0.22: self.blink_at = now + random.uniform(3, 8)
-        bt = now - self.blink_at; blink = math.sin(bt / 0.22 * math.pi) if 0 <= bt <= 0.22 else 0.0
-        want = 1.0 if not watch else (0.0 if on else 0.42)     # closed = auto-detect game is off
-        el = getattr(self, "eye_lid", want); el += max(-0.16, min(0.16, want - el)); self.eye_lid = el   # mechanical open / close
+        # --- blink every 3-8 s
+        if now > getattr(self, "blink_at", 0.0) + 0.26: self.blink_at = now + random.uniform(3, 8)
+        bt = now - self.blink_at; blink = math.sin(bt / 0.26 * math.pi) if 0 <= bt <= 0.26 else 0.0
+        want = 1.0 if not watch else (0.0 if on else 0.42)     # shut = auto-detect game is off
+        el = getattr(self, "eye_lid", want); el += max(-0.09, min(0.09, want - el)); self.eye_lid = el   # mechanical open / close
         lid = max(blink if el < 0.5 else 0.0, el)      # 0 open .. 1 shut
-        # --- ring
-        if strike > 0:
-            rr = r * (1.0 + 0.6 * (1 - strike)); c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, outline=lerp(BG, ORANGE, strike), width=2)
-        c.create_oval(cx - r, cy - r, cx + r, cy + r, fill="#07080B", outline=lerp(RED_DIM, RED, 0.55 + 0.45 * math.sin(t * 3)) if on else RED_DIM, width=2)
-        spin = t * (30 if on else 6)
-        for q in range(24):
-            a = math.radians(q * 15 + spin); major = q % 6 == 0; r1 = r * (0.78 if major else 0.84)
-            c.create_line(cx + r1 * math.cos(a), cy + r1 * math.sin(a), cx + r * 0.92 * math.cos(a), cy + r * 0.92 * math.sin(a),
-                          fill=(RED if on else RED_DIM) if major else lerp(BG, RED_DIM, 0.8), width=2 if major else 1)
-        # --- iris: glowing rings, hot core, black pupil, white glint
-        hot = ORANGE if strike > 0 else RED
-        ex, ey, ir = cx + ox, cy + oy, r * 0.44
-        glow = 0.75 + 0.25 * math.sin(t * 5) if on else 0.35
-        for k, (f, a) in enumerate(((1.45, 0.12), (1.22, 0.25), (1.0, 0.55), (0.78, 0.85))):
-            rr = ir * f; c.create_oval(ex - rr, ey - rr, ex + rr, ey + rr, fill=lerp("#07080B", hot, a * glow), outline="")
-        c.create_oval(ex - ir, ey - ir, ex + ir, ey + ir, outline=lerp(RED_DIM, hot, glow), width=1)
-        pr = ir * (0.36 + 0.12 * strike) * (1.15 if not on else 1.0)
-        c.create_oval(ex - pr, ey - pr, ex + pr, ey + pr, fill="#050506", outline=lerp("#050506", hot, 0.6))
-        g = ir * 0.16; c.create_oval(ex - ir * 0.42 - g, ey - ir * 0.42 - g, ex - ir * 0.42 + g, ey - ir * 0.42 + g, fill=lerp(hot, WHITE, 0.7), outline="")
-        # --- shutters (top + bottom lid plates meeting in the middle)
-        if lid > 0.01:
-            s = r * 0.7; cut = s * (1 - lid)                      # lids = circle segments cut at +-cut from the centre
-            ha = math.acos(max(-1.0, min(1.0, cut / s)))
-            for sgn in (-1, 1):
-                pts = []
-                for q in range(17):
-                    a = -ha + 2 * ha * q / 16
-                    pts += [cx + s * math.sin(a), cy + sgn * s * math.cos(a)]
-                c.create_polygon(*pts, fill="#101218", outline=RED_DIM)
-                c.create_line(cx - s * math.sin(ha), cy + sgn * cut, cx + s * math.sin(ha), cy + sgn * cut, fill=lerp(RED_DIM, RED, 0.5), width=1)
-        if lid > 0.97:                                   # shut: a faint red standby slit, like a sleeping cyborg
-            s2 = r * 0.6; pu = 0.5 + 0.5 * math.sin(t * 2.2)
-            c.create_line(cx - s2, cy, cx + s2, cy, fill=lerp(RED_DIM, RED, 0.25 + 0.45 * pu), width=2)
-            c.create_line(cx - s2 * 0.35, cy, cx + s2 * 0.35, cy, fill=lerp(RED, ORANGE, pu * 0.5), width=2)
-        # re-draw the socket rim on top so the lid plates stay inside the eye
-        c.create_oval(cx - r * 0.76, cy - r * 0.76, cx + r * 0.76, cy + r * 0.76, outline="#07080B", width=max(2, r * 0.2))
-        c.create_oval(cx - r * 0.66, cy - r * 0.66, cx + r * 0.66, cy + r * 0.66, outline=lerp(RED_DIM, hot, 0.35), width=1)
-        # lock-on brackets
-        b, a = r * 0.98, r * 0.2; bc = ORANGE if on else lerp(BG, ORANGE, 0.45)
-        for sx, sy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
-            px, py = cx + sx * b, cy + sy * b
-            c.create_line(px, py, px - sx * a, py, fill=bc, width=2); c.create_line(px, py, px, py - sy * a, fill=bc, width=2)
+        lid = lid * lid * (3 - 2 * lid)                # ease in / out like a servo
+        def hexp(x, y, R, rot=-90.0):                  # 6 corners; rot -90 = pointy top (like the logo), 0 = flat top
+            return [v for q in range(6) for v in (x + R * math.cos(math.radians(rot + 60 * q)), y + R * math.sin(math.radians(rot + 60 * q)))]
+        dark, hot = T("#0D0E11"), (ORANGE if strike > 0 else (GREEN if THEME == "blackwatch" else ORANGE))
+        rim = lerp(RED_DIM, RED, 0.6 + 0.4 * math.sin(t * 3)) if on else RED_DIM
+        # --- strike: hex shock ring
+        if strike > 0: c.create_polygon(*hexp(cx, cy, r * (1.0 + 0.6 * (1 - strike))), fill="", outline=lerp(BG, ORANGE, strike), width=2)
+        # --- armour frame: red edge, black band, thin red line
+        c.create_polygon(*hexp(cx, cy, r), fill=rim, outline="")
+        c.create_polygon(*hexp(cx, cy, r * 0.92), fill=dark, outline="")
+        c.create_polygon(*hexp(cx, cy, r * 0.86), fill=dark, outline=lerp(RED_DIM, RED, 0.5), width=1)
+        # --- the core (under the lids): black socket, orange hex ring, bright hex centre - looks at the pointer
+        ri = r * 0.47; c.create_polygon(*hexp(cx, cy, ri), fill=dark, outline="")
+        glow = 0.75 + 0.25 * math.sin(t * 5) if on else 0.45
+        ex, ey = cx + ox, cy + oy
+        c.create_polygon(*hexp(ex, ey, r * 0.36, 0), fill=lerp(dark, hot, 0.25 * glow), outline="")          # glow halo
+        c.create_polygon(*hexp(ex, ey, r * 0.29, 0), fill=lerp(dark, hot, 0.55 + 0.45 * glow), outline="")
+        core = r * (0.15 + 0.03 * strike)
+        c.create_polygon(*hexp(ex, ey, core, 0), fill=lerp(hot, WHITE, 0.55 + 0.35 * glow), outline="")
+        # --- 6 lids: armour plates whose inner edge slides to the centre with a twist (camera aperture)
+        ro, tw = r * 0.84, 28.0 * lid
+        rin = ri * (1 - lid)
+        corner = lambda q, R, extra=0.0: (cx + R * math.cos(math.radians(-90 + 60 * q + extra)), cy + R * math.sin(math.radians(-90 + 60 * q + extra)))
+        for q in range(6):
+            a0, a1 = corner(q, ro), corner(q + 1, ro)
+            b1, b0 = corner(q + 1, rin, tw), corner(q, rin, tw)
+            mid = math.radians(-60 + 60 * q)                                       # plate centre direction
+            shade = 0.5 + 0.5 * math.cos(mid - math.radians(-130))                 # light from the top left, like the logo
+            fill = lerp(lerp(BG, RED_DIM, 0.9), lerp(RED, WHITE, 0.08), 0.25 + 0.6 * shade)
+            c.create_polygon(*a0, *a1, *b1, *b0, fill=fill, outline=dark, width=max(1, int(r * 0.07)))
+            rr = (ro + rin) / 2 if lid < 0.6 else ro * 0.62                           # rivet in the middle of each plate
+            rx, ry = cx + rr * math.cos(mid + math.radians(tw * 0.5)), cy + rr * math.sin(mid + math.radians(tw * 0.5))
+            c.create_oval(rx - 1, ry - 1, rx + 1.2, ry + 1.2, fill=lerp(dark, RED_DIM, 0.3), outline="")
+        if lid > 0.97:                                   # shut: a faint standby glow where the lids meet, like a sleeping cyborg
+            pu = 0.5 + 0.5 * math.sin(t * 2.2); g = r * 0.07
+            c.create_polygon(*hexp(cx, cy, g * 1.6, 0), fill=lerp(dark, hot, 0.2 + 0.35 * pu), outline="")
+            c.create_polygon(*hexp(cx, cy, g, 0), fill=lerp(RED, hot, pu), outline="")
 
 
     def pump(self):
@@ -3733,6 +5097,11 @@ class App:
                 elif m[0] == "learn": self.learn_game(m[1], m[2])
                 elif m[0] == "fg": self.update_pause(); self.on_foreground(m[1])
                 elif m[0] == "status": self.status_lbl.config(text="▸ " + m[1])
+                elif m[0] == "stat":
+                    _, i, cnt, lv = m; self.combo.success(); self.tree.set_count(i, cnt)
+                    if self.rank_side.open: self.rank_side.draw()
+                    if lv: self.combo.level_up(lv)
+                elif m[0] == "combo_miss": self.combo.miss()
         except queue.Empty:
             pass
         self.root.after(40, self.pump)
@@ -3767,13 +5136,19 @@ class App:
         self.listening = not self.listening; self.cfg["listening"] = self.listening; self.update_listen_btn(); self.save_settings()
         self.log("listening UNLOCKED - commands are live" if self.listening else "listening LOCKED - nothing you say will fire", "sys")
         self.play("unlocked" if self.listening else "locked", "ptt")
-        self.speak("Listening online." if self.listening else "Listening offline.", confirm=True, delay=0.35)
+        lines = {("blackwatch", "en"): ("Comms online. Standing by.", "Comms offline."), ("blackwatch", "de"): ("Funk online. Bereit.", "Funk offline."),
+                 ("any", "de"): ("Zuhören aktiv.", "Zuhören gesperrt."), ("any", "en"): ("Listening online.", "Listening offline.")}
+        on, off = lines.get((THEME, APP_LANG)) or lines[("any", APP_LANG)]
+        self.speak(on if self.listening else off, confirm=True, delay=0.35)
 
     def apply_settings(self, new):
         old = dict(self.cfg); self.cfg.update(new); self.save_settings()
         self.root.attributes("-topmost", bool(self.cfg["ontop"])); self.update_info(); self.sfx.set_volume(self.cfg.get("volume", 70))
-        if new["mic"] != old["mic"]: self.start_capture(); self.mic_var.set(new["mic"] or DEFAULT_MIC)
+        if (new["mic"], new.get("listen_src"), new.get("speaker_dev")) != (old["mic"], old.get("listen_src", "mic"), old.get("speaker_dev", "")):
+            self.start_capture(); self.mic_var.set(self.source_label())
         set_priority(self.cfg.get("game_first", True)); self.update_pause()
+        if self.cfg.get("theme", "skynet") != old.get("theme", "skynet") or self.cfg.get("app_lang", "en") != old.get("app_lang", "en"):
+            self.root.after(300, self.restart); return
         if new.get("auto_switch") != old.get("auto_switch") or (new.get("auto_switch") and not self.autogame_on()): self.set_autogame(bool(new.get("auto_switch")))
         self.log("settings saved" + (" - reloading speech model" if self.want_key() != self.model_key else ""), "sys")
 
@@ -3788,20 +5163,39 @@ class App:
         if not WIN: return
         lnk = os.path.join(ROOT if PORTABLE else HERE, "Skynet Command.lnk")
         moved = PORTABLE and self.cfg.get("lnk_root") not in (None, ROOT)            # folder was moved -> old shortcut points nowhere
-        if moved or (self.cfg.get("icon_ver") != 3 and self.icon.endswith("skynet_command.ico")):   # new eye icon -> rebuild shortcut
-            self.cfg["icon_ver"] = 3; self.cfg["lnk_root"] = ROOT; self.save_settings()
+        ico = self.icon
+        if ico.endswith("skynet_command.ico"):            # Windows caches icons by file path -> a new file name forces the new picture everywhere
+            ico = os.path.join(HERE, f"skynet_command_v{ICON_VER}.ico")
+            try:
+                if not os.path.exists(ico): shutil.copyfile(self.icon, ico)
+            except Exception: ico = self.icon
+        if moved or (self.cfg.get("icon_ver") != ICON_VER and ico != self.icon):      # new icon -> rebuild shortcut + fix other shortcuts to this app
+            self.cfg["icon_ver"] = ICON_VER; self.cfg["lnk_root"] = ROOT; self.save_settings()
             try: os.remove(lnk)
             except Exception: pass
-            try: subprocess.Popen(["ie4uinit.exe", "-show"], creationflags=0x08000000)   # refresh Windows' icon cache
+            fix = (f"$w=New-Object -ComObject WScript.Shell;foreach($d in @([Environment]::GetFolderPath('Desktop'),[Environment]::GetFolderPath('CommonDesktopDirectory'),"
+                   f"[Environment]::GetFolderPath('StartMenu'),[Environment]::GetFolderPath('CommonStartMenu'),(Join-Path $env:APPDATA 'Microsoft\\Internet Explorer\\Quick Launch'))){{"
+                   f"if($d -and (Test-Path $d)){{Get-ChildItem -Path $d -Filter *.lnk -Recurse -ErrorAction SilentlyContinue|ForEach-Object{{try{{$s=$w.CreateShortcut($_.FullName);"
+                   f"if(($s.Arguments+$s.TargetPath) -like '*skynet_command*'){{$s.IconLocation='{ico},0';$s.Save()}}}}catch{{}}}}}}}};"
+                   f"ie4uinit.exe -show")                                                # only shortcuts that start Skynet Command, then refresh Windows' icon cache
+            try: subprocess.Popen(["powershell", "-NoProfile", "-Command", fix], creationflags=0x08000000)
             except Exception: pass
         if os.path.exists(lnk): return
         self.cfg["lnk_root"] = ROOT
         vpy = sys.executable.replace("python.exe", "pythonw.exe")
         ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}');$s.TargetPath='{vpy}';"
               f"$s.Arguments='\"{os.path.abspath(__file__)}\"';$s.WorkingDirectory='{HERE}';"
-              + (f"$s.IconLocation='{self.icon},0';" if self.icon else "") + "$s.Description='Skynet Command';$s.Save()")
+              + (f"$s.IconLocation='{ico},0';" if ico else "") + "$s.Description='Skynet Command';$s.Save()")
         try: subprocess.Popen(["powershell", "-NoProfile", "-Command", ps], creationflags=0x08000000)
         except Exception: pass
+
+    def restart(self):
+        """switch theme: start a fresh copy (it waits for this one to close), then close"""
+        self.log("restarting to switch theme / language…", "sys"); self.save_settings()
+        exe = sys.executable.replace("python.exe", "pythonw.exe") if WIN else sys.executable
+        try: subprocess.Popen([exe, os.path.abspath(__file__), "--restart"], cwd=HERE)
+        except Exception as e: self.log(f"restart failed: {e} - please start the app again", "err"); return
+        self.root.after(200, self.quit)
 
     def quit(self):
         self.exec.abort(); self.save_settings()

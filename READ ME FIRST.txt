@@ -14,7 +14,7 @@ INSTALL (one time, needs internet, ~5 minutes, Windows 10 or 11)
   3. When it says DONE, Skynet Command starts. The very first start downloads the speech model once.
 
 START IT
-  Double-click  "Skynet Command"  (the eye icon) - or "Skynet Command.bat".
+  Double-click  "Skynet Command"  (the hex icon) - or "Skynet Command.bat".
 
 NVIDIA GRAPHICS CARD? (optional, ~1 GB)
   Double-click "GPU boost (NVIDIA only).bat" - the bigger, more accurate model then runs on your graphics card.
@@ -25,6 +25,8 @@ QUICK TIPS
   - Click the eye (top left) to switch auto-detect game on/off. Click the first symbol top right to switch the speech AI off/on.
   - Lower OPTIONS -> MACRO SPEED (e.g. 30-35 ms) for faster stratagems; raise it if the game misses arrows.
   - A command not recognised? Click its line in the COMMAND LOG to teach it.
+  - Friends on Discord should be able to say commands too? RECORDING DEVICE (main window) -> "SPEAKERS >" or "* ALL SOUND SOURCES".
+  - OPTIONS -> LOOK: 3 themes (Skynet / Nano / Blackwatch) and COMMAND LANGUAGE (english / deutsch).
 
 UNINSTALL
   Delete this folder (and the Desktop shortcut if you made one). That's all.

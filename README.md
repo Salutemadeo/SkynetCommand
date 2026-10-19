@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/logo.png" width="160" alt="Skynet Command eye logo"></p>
+<p align="center"><img src="docs/logo.png" width="160" alt="Skynet Command logo"></p>
 
 <h1 align="center">SKYNET COMMAND</h1>
 <p align="center"><b>Voice macros for games, powered by the Whisper speech AI</b><br>
@@ -17,7 +17,7 @@ Say <i>"hellbomb"</i>, <i>"orbital laser"</i>, <i>"resupply"</i> and the stratag
 1. **[⬇ Download SkynetCommand.zip](https://github.com/Salutemadeo/SkynetCommand/raw/main/download/SkynetCommand.zip)** and unzip it anywhere (e.g. Documents). Don't run it from inside the zip.
    *(or: green **Code** button → **Download ZIP** - same files)*
 2. Double-click **`1 - SETUP (run once).bat`**. It needs internet once (~5 minutes) and puts a private Python and the speech engine **inside that folder**. Nothing is installed in Windows.
-3. Start it with the **Skynet Command** shortcut (eye icon). The first start downloads the speech model once.
+3. Start it with the **Skynet Command** shortcut (hex icon). The first start downloads the speech model once.
 
 If Windows says *"Windows protected your PC"*, click **More info → Run anyway** (the scripts are plain text, you can read them in `app\install.ps1`).
 
@@ -31,7 +31,13 @@ If Windows says *"Windows protected your PC"*, click **More info → Run anyway*
 - **Whisper speech AI, fully offline:** tolerant of accents and mishearing (sound-alike matching, second careful pass, click a log line to teach it a phrase).
 - **Push-to-talk or always-listening**, lock / unlock hotkey, auto-detects your game and switches profiles.
 - **Game first:** performance settings (AI load, GPU memory saver, CPU threads, low priority, animations pause in game, late commands dropped).
-- Skynet look: the eye watches your cursor (click it = auto-detect game on/off), click the AI symbol to switch the speech AI off/on, machine sounds, optional robot voice.
+- **3 themes:** Skynet (red machine HUD), Nano (pale-mint suit HUD) and Blackwatch (black + military yellow, radio comms). Each has its own sounds and voice.
+- **Deutsch:** a full German interface with its own German profile, using the in-game German stratagem names. Your English profiles stay separate.
+- **Friends can command too:** under RECORDING DEVICE, pick SPEAKERS ▸ or ★ ALL SOUND SOURCES. Teammates on Discord or in-game voice chat can then say commands, and game noise is filtered out.
+- **Combo counter and 50 ranks:** xN counters on every command, a main combo and Blackwatch-style military ranks.
+- **Hear how to say it:** the ♪ button reads a command aloud, which helps when learning the German names.
+- The Skynet eye (6 armoured lids) watches your cursor; click it to turn auto-detect game on or off. Click the AI symbol to switch the speech AI off or on.
+- *Optional:* stratagem icons. If you own the "BIT BETTER UI" mod, its icons can be shown next to each command. They are not included here, because that art belongs to its author.
 
 <p align="center"><img src="docs/options.png" width="720" alt="Options window"></p>
 
@@ -46,7 +52,7 @@ If Windows says *"Windows protected your PC"*, click **More info → Run anyway*
 | | |
 |---|---|
 | `1 - SETUP (run once).bat` | one-time setup (private Python + speech engine into `runtime\`) |
-| `Skynet Command.bat` | starts the app (the setup also makes an eye-icon shortcut) |
+| `Skynet Command.bat` | starts the app (the setup also makes a shortcut) |
 | `GPU boost (NVIDIA only).bat` | optional CUDA libraries for NVIDIA cards |
 | `app\` | the program (`skynet_command.py`), your settings and profiles, `CHANGELOG.md` |
 | `runtime\`, `models\` | created by setup / first start (not in the repository) |
