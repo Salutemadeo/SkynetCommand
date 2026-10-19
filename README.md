@@ -6,6 +6,8 @@ Say <i>"hellbomb"</i>, <i>"orbital laser"</i>, <i>"resupply"</i> and the stratag
 
 <p align="center"><a href="https://github.com/Salutemadeo/SkynetCommand/raw/main/download/SkynetCommand.zip"><b>⬇ DOWNLOAD (Windows)</b></a></p>
 
+<p align="center"><img src="docs/main.png" width="900" alt="Skynet Command main window"><br><sub>Main window: commands with arrow codes, use counters, combo and rank, command log. The stratagem icons come from the optional BIT BETTER UI mod and are not included.</sub></p>
+
 <p align="center">Made by <b>Salutem</b> · <a href="https://steamcommunity.com/id/hecton/">Steam</a> · Discord: <code>hekton</code></p>
 
 > [!IMPORTANT]
@@ -39,7 +41,7 @@ If Windows says *"Windows protected your PC"*, click **More info → Run anyway*
 - The Skynet eye (6 armoured lids) watches your cursor; click it to turn auto-detect game on or off. Click the AI symbol to switch the speech AI off or on.
 - *Optional:* stratagem icons. If you own the "BIT BETTER UI" mod, its icons can be shown next to each command. They are not included here, because that art belongs to its author.
 
-<p align="center"><img src="docs/options.png" width="720" alt="Options window"></p>
+<p align="center"><img src="docs/options.png" width="900" alt="Options window"><br><sub>Options: listening, speech AI, look (themes and language), macros, sound and performance.</sub></p>
 
 ## Tips
 
